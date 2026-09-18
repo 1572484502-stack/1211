@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:43127; media-src 'self' blob: data: https:; img-src 'self' data: blob: https:;" />
+    <title>视界工坊 · Vista Studio</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="titlebar">
+      <div class="titlebar-brand"><span class="logo-pulse">⌁</span><strong>视界工坊</strong><small>VISTA STUDIO</small></div>
+      <div class="titlebar-center">本地智能影音创作工作台</div>
+      <div class="window-controls">
+        <button id="minimizeBtn" aria-label="最小化">—</button>
+        <button id="maximizeBtn" aria-label="最大化">□</button>
+        <button id="closeBtn" class="close" aria-label="关闭">×</button>
+      </div>
+    </header>
+
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark"><i></i><i></i><i></i><i></i><i></i></div>
+          <div><strong>视界工坊</strong><span>Vista Studio</span></div>
+        </div>
+        <nav class="main-nav">
+          <p>创作工具</p>
+          <button class="nav-item active" data-feature-action="music"><span class="nav-icon">♫</span><span><strong>音乐重编排</strong><small>分析与时长重塑</small></span></button>
+          <button id="historyBtn" class="nav-item"><span class="nav-icon">◷</span><span><strong>历史记录</strong><small>查看最近生成任务</small></span></button>
+        </nav>
+        <div class="local-card"><span class="local-dot"></span><div><strong>本地模式</strong><small>音乐素材仅在本机处理</small></div></div>
+      </aside>
+
+      <main class="workspace">
+        <div class="content-wrap" data-feature-view="music">
+          <section class="module-card">
+            <div class="module-glow glow-one"></div><div class="module-glow glow-two"></div>
+            <div class="module-top">
+              <div><span class="module-kicker">SMART MUSIC</span><h1>智能音乐重编排</h1></div>
+              <div class="local-pill"><span></span>本地处理</div>
+            </div>
+            <div class="workflow-tabs">
+              <button id="analysisTab" class="workflow-tab active" data-panel="analysis"><span class="tab-icon">▥</span><strong>段落分析</strong><small>识别节拍与结构</small></button>
+              <div class="tab-line"><i></i></div>
+              <button id="retargetTab" class="workflow-tab" data-panel="retarget"><span class="tab-icon">↔</span><strong>时长重塑</strong><small>生成指定长度版本</small></button>
+            </div>
+            <div id="fileBar" class="file-bar hidden">
+              <div class="file-icon">♪</div>
+              <div><strong id="trackName">—</strong><small id="trackInfo">正在读取…</small></div>
+              <button id="replaceBtn" class="outline-btn">重新上传</button>
+            </div>
+          </section>
+
+          <section id="dropZone" class="upload-card">
+            <input id="fileInput" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg" hidden />
+            <div class="upload-disc"><span>♪</span><i class="ring r1"></i><i class="ring r2"></i></div>
+            <div class="upload-copy"><span class="section-kicker">开始分析</span><h2>拖入一首完整歌曲</h2><p>我们会在本机分析节拍、能量与段落结构，不会上传你的音乐。</p><div class="format-chips"><span>MP3</span><span>WAV</span><span>M4A</span><span>AAC</span><span>FLAC</span><span>OGG</span></div></div>
+            <button id="chooseFileBtn" class="primary-btn">选择音乐文件 <b>→</b></button>
+          </section>
+
+          <section id="loadingPanel" class="loading-card hidden">
+            <div class="loader-orbit"><i></i></div>
+            <div><strong>正在建立歌曲结构</strong><p id="loadingDetail">读取波形与节拍信息…</p></div>
+            <em id="loadingPercent">0%</em>
+          </section>
+
+          <section id="musicWorkbench" class="hidden">
+            <div id="analysisPanel" class="view-panel">
+              <div class="metric-grid">
+                <article><span>BPM</span><strong id="metricBpm" class="purple">—</strong><small>每分钟节拍</small></article>
+                <article><span>歌曲时长</span><strong id="metricDuration" class="orange">—</strong><small>分 : 秒</small></article>
+                <article><span>估计小节</span><strong id="metricBars" class="blue">—</strong><small>按四拍小节计算</small></article>
+                <article><span>音频声道</span><strong id="metricChannels" class="cyan">—</strong><small id="metricSampleRate">采样率</small></article>
+              </div>
+
+              <article class="analysis-card">
+                <div class="card-toolbar">
+                  <div><span class="section-kicker">STRUCTURE MAP</span><h2>选择参与重编排的歌曲段落</h2></div>
+                  <div class="toolbar-right"><div class="legend"><span><i class="verse"></i>平稳</span><span><i class="lift"></i>推进</span><span><i class="chorus"></i>高潮</span><span><i class="outro"></i>收尾</span></div><div class="selection-tools"><button id="selectAllBtn">全选</button><button id="clearSelectionBtn">清空</button></div></div>
+                </div>
+                <div class="wave-shell">
+                  <div class="wave-controls"><button id="sourcePlayBtn">▶ <span>试听原曲</span></button><span id="sourceTime">00:00</span><button id="zoomBtn">1×</button><span class="beat-pill">强拍与乐句已对齐</span></div>
+                  <canvas id="waveform" height="135"></canvas>
+                  <div class="time-ruler"><span>00:00</span><span id="time25">—</span><span id="time50">—</span><span id="time75">—</span><span id="trackDuration">—</span></div>
+                  <div id="segmentBand" class="segment-band"></div>
+                </div>
+                <div class="analysis-note"><span>i</span><p><strong>点击下方彩色段落即可选择或排除。</strong>只有选中的段落会参与后续重编排。当前已选择 <b id="selectedCount">0</b> 个段落。</p><button id="goRetargetBtn">用所选段落重塑时长 →</button></div>
+              </article>
+            </div>
+
+            <div id="retargetPanel" class="view-panel hidden">
+              <article class="target-card">
+                <div><span class="section-kicker">TARGET DURATION</span><h2>设定目标时长</h2><p>输入任意长度，系统会按自然小节生成多个候选版本。</p></div>
+                <div class="duration-control"><label><input id="targetMinutes" type="number" min="0" max="59" value="1" /><span>分</span></label><b>:</b><label><input id="targetSeconds" type="number" min="0" max="59" value="0" /><span>秒</span></label></div>
+                <div class="preset-row"><button data-seconds="30">30 秒</button><button data-seconds="60" class="active">1 分钟</button><button data-seconds="90">1分30秒</button><button data-seconds="120">2 分钟</button></div>
+                <button id="analyzeBtn" class="generate-btn"><span>✦</span><strong>生成候选方案</strong><small>一次生成三个版本</small></button>
+              </article>
+
+              <article class="retarget-map">
+                <div class="card-toolbar compact"><div><span class="section-kicker">SOURCE MAP</span><h2>参与编排的原曲段落</h2><p class="map-help">彩色段落将参与生成，浅灰段落会被排除。点击色块仍可调整选择。</p></div><span class="duration-summary">原曲 <b id="sourceDurationLabel">—</b> · 目标 <b id="targetDurationLabel">01:00</b></span></div>
+                <canvas id="retargetWaveform" height="110"></canvas>
+                <div id="retargetSegmentBand" class="segment-band slim"></div>
+              </article>
+
+              <div id="progressPanel" class="progress-panel hidden"><div><span class="spinner"></span><strong id="progressTitle">正在生成候选方案</strong><em id="progressPercent">0%</em></div><div class="progress-track"><i id="progressBar"></i></div><p id="progressDetail">正在匹配自然小节…</p></div>
+
+              <section id="resultsSection" class="results-section hidden">
+                <div class="result-heading"><div><span class="section-kicker">CANDIDATES</span><h2>候选方案</h2></div><p>建议依次试听，选择衔接最自然的一版。</p></div>
+                <div id="resultsGrid" class="results-list"></div>
+              </section>
+            </div>
+          </section>
+
+          <footer><span>VISTA STUDIO · 视界工坊</span><span>本地智能影音创作工作台</span></footer>
+        </div>
+
+      </main>
+    </div>
+
+    <audio id="sourceAudio" hidden></audio>
+    <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
+    <aside id="historyDrawer" class="history-drawer" aria-hidden="true">
+      <div class="drawer-head"><div><span class="section-kicker">LOCAL HISTORY</span><h2>历史记录</h2></div><button id="closeHistoryBtn">×</button></div>
+      <p class="drawer-intro">仅保存任务信息，不保存或上传你的音乐文件。</p>
+      <div id="historyList" class="history-list"></div>
+      <button id="clearHistoryBtn" class="clear-history-btn">清空历史记录</button>
+    </aside>
+    <div id="toast" class="toast"></div>
+    <script src="./core/runtime.js"></script>
+    <script src="./core/media-session.js"></script>
+    <script src="./core/storage.js"></script>
+    <script src="./core/shell.js"></script>
+    <script src="./audio-engine.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

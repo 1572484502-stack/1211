@@ -1,0 +1,15 @@
+{
+  "name": "vista-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "视界工坊（Vista Studio）— 本地智能影音创作工作台",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "serve": "node server.cjs"
+  },
+  "devDependencies": {
+    "electron": "^38.0.0"
+  }
+}
