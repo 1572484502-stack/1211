@@ -40,7 +40,8 @@
   const FFT_SIZE = 2048;
   const FFT_HOP = 1024;
   const SPECTRAL_LOW_HZ = 55;
-  const SPECTRAL_HIGH_HZ = 2000;
+  const CHROMA_HIGH_HZ = 2000;
+  const SPECTRAL_HIGH_HZ = 5000;
 
   function fftInPlace(re, im) {
     const n = re.length;
@@ -102,6 +103,8 @@
     const frameCount = Math.max(1, Math.floor((signal.length - FFT_SIZE) / FFT_HOP) + 1);
     const chromaFrames = new Float32Array(frameCount * 12);
     const centroids = new Float32Array(frameCount);
+    const spectralFlux = new Float32Array(frameCount);
+    const vocalActivity = new Float32Array(frameCount);
     const window = new Float32Array(FFT_SIZE);
     for (let i = 0; i < FFT_SIZE; i += 1) {
       window[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1));
@@ -110,7 +113,12 @@
     const im = new Float32Array(FFT_SIZE);
     const binHz = rate / FFT_SIZE;
     const lowBin = Math.max(1, Math.floor(SPECTRAL_LOW_HZ / binHz));
-    const highBin = Math.min(FFT_SIZE / 2, Math.ceil(SPECTRAL_HIGH_HZ / binHz));
+    const highBin = Math.min(FFT_SIZE / 2 - 1, Math.ceil(SPECTRAL_HIGH_HZ / binHz));
+    const chromaHighBin = Math.min(highBin, Math.ceil(CHROMA_HIGH_HZ / binHz));
+    const vocalLowBin = Math.max(lowBin, Math.floor(160 / binHz));
+    const vocalHighBin = Math.min(highBin, Math.ceil(3500 / binHz));
+    const magnitudes = new Float32Array(highBin + 2);
+    const previousMagnitudes = new Float32Array(highBin + 2);
 
     for (let frame = 0; frame < frameCount; frame += 1) {
       const from = frame * FFT_HOP;
@@ -124,15 +132,35 @@
       let weighted = 0;
       const base = frame * 12;
       for (let k = lowBin; k <= highBin; k += 1) {
-        const magnitude = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+        const magnitude = Math.log1p(Math.sqrt(re[k] * re[k] + im[k] * im[k]));
+        magnitudes[k] = magnitude;
         if (magnitude <= 0) continue;
         const frequency = k * binHz;
-        const midi = Math.round(69 + 12 * Math.log2(frequency / 440));
-        const pitchClass = ((midi % 12) + 12) % 12;
-        chromaFrames[base + pitchClass] += magnitude;
         sum += magnitude;
         weighted += frequency * magnitude;
       }
+      let positiveFlux = 0;
+      let vocalBandEnergy = 0;
+      for (let k = lowBin; k <= highBin; k += 1) {
+        positiveFlux += Math.max(0, magnitudes[k] - previousMagnitudes[k]);
+        previousMagnitudes[k] = magnitudes[k];
+        if (k >= vocalLowBin && k <= vocalHighBin) vocalBandEnergy += magnitudes[k];
+      }
+      spectralFlux[frame] = positiveFlux / Math.max(1e-6, sum);
+
+      // 色度只累计局部谱峰，避免宽带鼓声把十二个音级一起抬高。
+      let vocalPeakEnergy = 0;
+      for (let k = lowBin + 1; k < chromaHighBin; k += 1) {
+        const magnitude = magnitudes[k];
+        if (magnitude <= magnitudes[k - 1] || magnitude < magnitudes[k + 1]) continue;
+        const frequency = k * binHz;
+        const midi = Math.round(69 + 12 * Math.log2(frequency / 440));
+        const pitchClass = ((midi % 12) + 12) % 12;
+        chromaFrames[base + pitchClass] += magnitude * magnitude;
+        if (k >= vocalLowBin && k <= vocalHighBin) vocalPeakEnergy += magnitude;
+      }
+      const harmonicRatio = vocalPeakEnergy / Math.max(1e-6, vocalBandEnergy);
+      vocalActivity[frame] = vocalBandEnergy * (0.35 + Math.min(1, harmonicRatio * 5) * 0.65);
       let norm = 0;
       for (let c = 0; c < 12; c += 1) norm += chromaFrames[base + c] * chromaFrames[base + c];
       norm = Math.sqrt(norm);
@@ -142,13 +170,15 @@
       centroids[frame] = sum > 1e-9 ? weighted / sum : 0;
 
       if (frame % 200 === 0) {
-        progress(38 + (frame / frameCount) * 16, '分析和声与音色，寻找重复段落…');
+        progress(38 + (frame / frameCount) * 16, '分析和声、人声活动与音色，寻找歌词气口…');
         await yieldToUi();
       }
     }
     // 帧步长是在"抽取之后"的信号上计的，所以要用抽取后的采样率换算，
     // 不能乘回原采样率——否则每帧被低估 16 倍，除开头几小节外全部取不到数据。
-    return { chromaFrames, centroids, frameCount, secondsPerFrame: FFT_HOP / rate };
+    robustScale(spectralFlux);
+    robustScale(vocalActivity);
+    return { chromaFrames, centroids, spectralFlux, vocalActivity, frameCount, secondsPerFrame: FFT_HOP / rate };
   }
 
   // 分析过程是纯计算，中途要让出主线程，否则界面会整体卡住、进度文案不动
@@ -176,30 +206,109 @@
       }
     }
 
-    const onset = new Float32Array(frameCount);
-    let onsetMax = 1e-6;
+    // 先提取频谱通量。单看 RMS 会把持续变响误认成鼓点，也看不见响度不变的音色瞬态。
+    const spectral = await spectralFrames(mono, sampleRate, progress);
+    const rmsFlux = new Float32Array(frameCount);
     for (let i = 2; i < frameCount; i += 1) {
-      const localMean = (rms[i - 1] + rms[i - 2]) * 0.5;
-      onset[i] = Math.max(0, rms[i] - localMean);
-      onsetMax = Math.max(onsetMax, onset[i]);
+      const current = Math.log1p(rms[i] * 1000);
+      const previous = (Math.log1p(rms[i - 1] * 1000) + Math.log1p(rms[i - 2] * 1000)) * 0.5;
+      rmsFlux[i] = Math.max(0, current - previous);
     }
-    for (let i = 0; i < frameCount; i += 1) onset[i] /= onsetMax;
+    robustScale(rmsFlux);
+
+    const onset = new Float32Array(frameCount);
+    const onsetRaw = new Float32Array(frameCount);
+    const rmsSecondsPerFrame = hop / sampleRate;
+    for (let i = 0; i < frameCount; i += 1) {
+      const spectralPosition = (i * rmsSecondsPerFrame) / spectral.secondsPerFrame;
+      const left = Math.min(spectral.frameCount - 1, Math.max(0, Math.floor(spectralPosition)));
+      const right = Math.min(spectral.frameCount - 1, left + 1);
+      const fraction = spectralPosition - left;
+      const flux = spectral.spectralFlux[left] * (1 - fraction) + spectral.spectralFlux[right] * fraction;
+      // RMS 差分保留原采样率下约 20–25 ms 的节拍精度；频谱通量负责补足音色突变。
+      onsetRaw[i] = rmsFlux[i] * 0.68 + flux * 0.32;
+    }
+    const adaptiveWindow = Math.max(4, Math.round(0.35 / rmsSecondsPerFrame));
+    for (let i = 0; i < frameCount; i += 1) {
+      let local = 0;
+      let count = 0;
+      for (let k = Math.max(0, i - adaptiveWindow); k < i; k += 1) {
+        local += onsetRaw[k];
+        count += 1;
+      }
+      const value = Math.max(0, onsetRaw[i] - (local / Math.max(1, count)) * 0.48);
+      const isPeak = value >= (onsetRaw[i - 1] || 0) && value >= (onsetRaw[i + 1] || 0);
+      onset[i] = value * (isPeak ? 1 : 0.35);
+    }
+    robustScale(onset);
 
     const framesPerSecond = sampleRate / hop;
-    let bestBpm = 120;
-    let bestScore = -Infinity;
-    for (let bpm = 70; bpm <= 180; bpm += 1) {
-      const lag = Math.max(1, Math.round((60 / bpm) * framesPerSecond));
-      let score = 0;
-      for (let i = lag; i < frameCount; i += 1) score += onset[i] * onset[i - lag];
-      const centerBias = 1 - Math.abs(bpm - 118) / 700;
-      score *= centerBias;
-      if (score > bestScore) {
-        bestScore = score;
-        bestBpm = bpm;
+    const onsetPeaks = [];
+    const peakFloor = percentile([...onset], 0.78);
+    const peakSpacing = Math.max(2, Math.round(framesPerSecond * 0.18));
+    for (let i = 1; i < frameCount - 1; i += 1) {
+      if (onset[i] < peakFloor || onset[i] < onset[i - 1] || onset[i] < onset[i + 1]) continue;
+      const previousPeak = onsetPeaks[onsetPeaks.length - 1];
+      if (previousPeak !== undefined && i - previousPeak < peakSpacing) {
+        if (onset[i] > onset[previousPeak]) onsetPeaks[onsetPeaks.length - 1] = i;
+      } else {
+        onsetPeaks.push(i);
       }
+    }
+    const correlationAt = lagValue => {
+      const lag = Math.max(1, lagValue);
+      let dot = 0;
+      let leftPower = 0;
+      let rightPower = 0;
+      for (let i = Math.ceil(lag); i < frameCount; i += 1) {
+        const shifted = i - lag;
+        const left = Math.floor(shifted);
+        const fraction = shifted - left;
+        const delayed = onset[left] * (1 - fraction) + (onset[left + 1] || 0) * fraction;
+        dot += onset[i] * delayed;
+        leftPower += onset[i] * onset[i];
+        rightPower += delayed * delayed;
+      }
+      return dot / Math.max(1e-9, Math.sqrt(leftPower * rightPower));
+    };
+    const tempoCandidates = [];
+    for (let bpm = 60; bpm <= 200; bpm += 1) {
+      const lag = (60 / bpm) * framesPerSecond;
+      const autocorrelation = correlationAt(lag) * 0.62
+        + correlationAt(lag * 2) * 0.26
+        + correlationAt(lag * 4) * 0.12;
+      let intervalSupport = 0;
+      let intervalWeight = 0;
+      const beatSeconds = 60 / bpm;
+      for (let i = 1; i < onsetPeaks.length; i += 1) {
+        const interval = (onsetPeaks[i] - onsetPeaks[i - 1]) / framesPerSecond;
+        const beats = Math.max(1, Math.min(4, Math.round(interval / beatSeconds)));
+        const error = Math.abs(interval / beatSeconds - beats);
+        const weight = Math.sqrt((onset[onsetPeaks[i]] || 0) * (onset[onsetPeaks[i - 1]] || 0)) / beats;
+        intervalSupport += Math.exp(-0.5 * (error / 0.045) ** 2) * weight;
+        intervalWeight += weight;
+      }
+      intervalSupport /= Math.max(1e-9, intervalWeight);
+      const score = autocorrelation * 0.72 + intervalSupport * 0.28;
+      // 只给常见流行音乐速度一个很轻的先验，不能再用固定 118 BPM 把结果拉偏。
+      const prior = bpm >= 80 && bpm <= 160 ? 1 : 0.965;
+      tempoCandidates.push({ bpm, score: score * prior });
       if (bpm % 30 === 0) await yieldToUi();
     }
+    tempoCandidates.sort((a, b) => b.score - a.score);
+    let winner = tempoCandidates[0] || { bpm: 120, score: 0 };
+    if (winner.bpm > 160) {
+      const half = tempoCandidates.find(item => item.bpm === Math.round(winner.bpm / 2));
+      if (half && half.score >= winner.score * 0.9) winner = half;
+    } else if (winner.bpm < 80) {
+      const double = tempoCandidates.find(item => item.bpm === winner.bpm * 2);
+      if (double && double.score > winner.score * 1.04) winner = double;
+    }
+    const bestBpm = winner.bpm;
+    const scoreDistribution = tempoCandidates.map(item => item.score);
+    const tempoConfidence = Math.max(0, Math.min(1,
+      (winner.score - median(scoreDistribution)) / Math.max(0.05, mad(scoreDistribution) * 4)
+    ));
 
     const beatFrames = (60 / bestBpm) * framesPerSecond;
     const phaseLimit = Math.max(1, Math.round(beatFrames));
@@ -207,7 +316,10 @@
     let phaseScore = -1;
     for (let offset = 0; offset < phaseLimit; offset += 1) {
       let score = 0;
-      for (let p = offset; p < frameCount; p += beatFrames) score += onset[Math.round(p)] || 0;
+      for (let p = offset; p < frameCount; p += beatFrames) {
+        const frame = Math.round(p);
+        score += (onset[frame] || 0) + (onset[frame - 1] || 0) * 0.35 + (onset[frame + 1] || 0) * 0.35;
+      }
       if (score > phaseScore) {
         phaseScore = score;
         phase = offset;
@@ -215,20 +327,35 @@
     }
 
     const beatDuration = 60 / bestBpm;
-    const barDuration = beatDuration * 4;
-    const beatAccentTotals = [0, 0, 0, 0];
-    const beatAccentCounts = [0, 0, 0, 0];
-    let beatIndex = 0;
+    const beatAccents = [];
     for (let position = phase; position < frameCount; position += beatFrames) {
       const frame = Math.round(position);
-      const slot = beatIndex % 4;
-      beatAccentTotals[slot] += (onset[frame] || 0) * 0.72 + (rms[frame] || 0) * 0.28;
-      beatAccentCounts[slot] += 1;
-      beatIndex += 1;
+      beatAccents.push((onset[frame] || 0) * 0.78 + (rms[frame] || 0) * 0.22);
     }
-    const downbeatSlot = beatAccentTotals
-      .map((total, index) => total / Math.max(1, beatAccentCounts[index]))
-      .reduce((best, value, index, values) => value > values[best] ? index : best, 0);
+    const accentPeriodicity = meter => {
+      let dot = 0;
+      let powerA = 0;
+      let powerB = 0;
+      for (let i = meter; i < beatAccents.length; i += 1) {
+        dot += beatAccents[i] * beatAccents[i - meter];
+        powerA += beatAccents[i] ** 2;
+        powerB += beatAccents[i - meter] ** 2;
+      }
+      return dot / Math.max(1e-9, Math.sqrt(powerA * powerB));
+    };
+    const meter3Score = accentPeriodicity(3);
+    const meter4Score = accentPeriodicity(4);
+    // 只有三拍周期明显更强时才判为 3/4；模糊材料继续按最常见的 4/4 处理。
+    const beatsPerBar = meter3Score > meter4Score * 1.12 ? 3 : 4;
+    const barDuration = beatDuration * beatsPerBar;
+    const metricalAccent = beatsPerBar === 3 ? [1, 0.45, 0.55] : [1, 0.46, 0.72, 0.42];
+    const downbeatScores = new Array(beatsPerBar).fill(0);
+    for (let candidate = 0; candidate < beatsPerBar; candidate += 1) {
+      for (let i = 0; i < beatAccents.length; i += 1) {
+        downbeatScores[candidate] += beatAccents[i] * metricalAccent[(i - candidate + beatsPerBar) % beatsPerBar];
+      }
+    }
+    const downbeatSlot = downbeatScores.reduce((best, value, index, values) => value > values[best] ? index : best, 0);
     const phaseSeconds = (phase * hop) / sampleRate;
     const barPhaseSeconds = (phaseSeconds + downbeatSlot * beatDuration) % barDuration;
     const barCount = Math.max(1, Math.ceil((buffer.duration - barPhaseSeconds) / barDuration));
@@ -260,7 +387,6 @@
 
     progress(38, `检测到约 ${bestBpm} BPM，正在定位自然小节…`);
 
-    const spectral = await spectralFrames(mono, sampleRate, progress);
     const barChroma = new Float32Array(barCount * 12);
     const barCentroid = new Float32Array(barCount);
     for (let bar = 0; bar < barCount; bar += 1) {
@@ -321,6 +447,11 @@
       phaseSeconds,
       barPhaseSeconds,
       downbeatSlot,
+      tempoConfidence,
+      tempoAlternatives: tempoCandidates.slice(0, 5).map(item => ({ bpm: item.bpm, score: item.score })),
+      beatsPerBar,
+      vocalActivity: spectral.vocalActivity,
+      vocalSecondsPerFrame: spectral.secondsPerFrame,
       phraseBars: 4
     };
   }
@@ -407,25 +538,15 @@
     return vectors;
   }
 
-  /* 小节级相似度。
-   * 权重是按"对段落识别有多管用"排的，而不是听起来多专业：
-   * 实测流行歌整首和弦高度接近，纯靠色度算相似度会全部落在 0.9 以上、完全分不开段；
-   * 力度（能量）与鼓点密度才是真正把主歌和副歌分开的量；明亮度次之；色度只做兜底。 */
-  /* 小节级相似度的权重。这几个数字是拿四首真实歌曲做对照实验试出来的，不是照搬教科书。
-   *
-   * 关于 tone（和声色度）：权重刻意设为 0。
-   * 理论上和声自相似是判断"同一段再次出现"的正统依据，但实测在这套实现下它帮倒忙——
-   * 55–2000 Hz 频段里鼓组（底鼓基频、军鼓噪声）占了主要能量，
-   * 算出来的色度反映的是鼓而不是和声，两次副歌之间的色度相似度并不比副歌与主歌之间高，
-   * 把它计入总分反而把真正有效的线索稀释掉（实测会让 4 首歌里的 3 首出现"整首都不重复"）。
-   * 真正能把主歌和副歌分开的是**力度与鼓点密度**。想重新启用色度，需要先做谐波/打击分离，
-   * 那时再给它权重。 */
-  const SIMILARITY_WEIGHTS = { tone: 0, power: 0.52, drive: 0.34, colour: 0.14 };
+  /* 小节级相似度同时使用和声、力度、瞬态密度和音色。
+   * 色度现在只来自局部谱峰，并减去了全曲平均色度，因此可以用于识别重复和弦进行，
+   * 不再像旧实现那样被鼓组的宽带能量淹没。 */
+  const SIMILARITY_WEIGHTS = { tone: 0.38, power: 0.27, drive: 0.21, colour: 0.14 };
 
   function frameSimilarity(a, b) {
     let dot = 0;
     for (let i = 0; i < 12; i += 1) dot += a.chroma[i] * b.chroma[i];
-    const tone = Math.max(0, dot);
+    const tone = Math.max(0, Math.min(1, (dot + 1) * 0.5));
     const power = 1 - Math.min(1, Math.abs(a.energy - b.energy) * 2.2);
     const drive = 1 - Math.min(1, Math.abs(a.onset - b.onset) * 2.0);
     const colour = 1 - Math.min(1, Math.abs(a.centroid - b.centroid) * 1.8);
@@ -435,17 +556,25 @@
       + colour * SIMILARITY_WEIGHTS.colour;
   }
 
-  // 新颖度：某小节前后各 4 小节互不相似的程度，峰值就是段落换点
+  // 多尺度新颖度：同时看 2 小节换句与 4 小节乐句，避免只适合固定八小节结构。
   function noveltyCurve(vectors) {
     const barCount = vectors.length;
-    const span = 4;
     const raw = new Float32Array(barCount);
-    for (let i = span; i <= barCount - span; i += 1) {
-      let sum = 0;
-      for (let p = 0; p < span; p += 1) {
-        for (let q = 0; q < span; q += 1) sum += frameSimilarity(vectors[i - span + p], vectors[i + q]);
+    for (const span of [2, 4]) {
+      for (let i = span; i <= barCount - span; i += 1) {
+        let across = 0;
+        let within = 0;
+        for (let p = 0; p < span; p += 1) {
+          for (let q = 0; q < span; q += 1) {
+            across += frameSimilarity(vectors[i - span + p], vectors[i + q]);
+            within += frameSimilarity(vectors[i - span + p], vectors[i - span + q]);
+            within += frameSimilarity(vectors[i + p], vectors[i + q]);
+          }
+        }
+        const crossMean = across / (span * span);
+        const withinMean = within / (span * span * 2);
+        raw[i] += Math.max(0, withinMean - crossMean) * (span === 4 ? 0.65 : 0.35);
       }
-      raw[i] = 1 - sum / (span * span);
     }
     // 三点滑动平均，压掉"乐句内部换句"这类毛刺，只留真正的段落换点
     const smooth = new Float32Array(barCount);
@@ -459,7 +588,8 @@
   function sectionBounds(vectors) {
     const barCount = vectors.length;
     const smooth = noveltyCurve(vectors);
-    const cell = barCount >= 48 ? 8 : 4;
+    const cell = barCount >= 40 ? 8 : 4;
+    const noveltyFloor = percentile([...smooth], 0.58);
     const bounds = [0];
     for (let grid = cell; grid <= barCount - 4; grid += cell) {
       let best = grid;
@@ -471,7 +601,7 @@
         }
       }
       const previous = bounds[bounds.length - 1];
-      const snapped = best > previous + 3 ? best : grid;
+      const snapped = best > previous + 3 && bestValue >= noveltyFloor ? best : grid;
       if (snapped > previous + 3 && snapped < barCount - 2) bounds.push(snapped);
     }
     bounds.push(barCount);
@@ -711,8 +841,15 @@
     return bestStart;
   }
 
+  function musicalCrossfade(analysis) {
+    // 按 A/B 双轨思路让前段淡出、后段淡入。重叠约四分之三拍：足以形成
+    // 听得见的缓冲，又不会覆盖完整一拍而把两个重音叠成抢拍。
+    return Math.max(0.22, Math.min(0.48, analysis.beatDuration * 0.72));
+  }
+
   function buildPlan(buffer, targetSeconds, analysis, strategy) {
     const { barDuration, barCount, barEnergy } = analysis;
+    const origin = analysis.barPhaseSeconds || 0;
     const targetBars = Math.max(3, Math.min(barCount - 1, Math.round(targetSeconds / barDuration)));
     let introBars = targetBars < 9 ? 1 : Math.max(2, Math.round(targetBars * 0.15));
     let outroBars = targetBars < 9 ? 1 : Math.max(2, Math.round(targetBars * 0.14));
@@ -725,9 +862,9 @@
     const outroStart = Math.max(0, barCount - outroBars);
 
     const rawSegments = [
-      { start: 0, end: Math.min(buffer.duration, introBars * barDuration), role: '开头' },
-      { start: middleStart * barDuration, end: Math.min(buffer.duration, (middleStart + middleBars) * barDuration), role: '核心段落' },
-      { start: outroStart * barDuration, end: buffer.duration, role: '原曲结尾' }
+      { start: 0, end: Math.min(buffer.duration, origin + introBars * barDuration), role: '开头' },
+      { start: origin + middleStart * barDuration, end: Math.min(buffer.duration, origin + (middleStart + middleBars) * barDuration), role: '核心段落' },
+      { start: Math.max(0, origin + outroStart * barDuration), end: buffer.duration, role: '原曲结尾' }
     ];
 
     const segments = [];
@@ -752,8 +889,8 @@
       cutCount: Math.max(0, segments.length - 1),
       selectedEnergy,
       targetBars,
-      crossfadeSeconds: Math.max(0.18, Math.min(0.75, analysis.beatDuration)),
-      cutMode: '小节对齐 · 整拍交叉衔接'
+      crossfadeSeconds: musicalCrossfade(analysis),
+      cutMode: '小节起点对齐 · A/B 轨等功率交叉淡化'
     };
   }
 
@@ -775,6 +912,53 @@
     const firstBar = Math.max(0, Math.floor((start - origin) / analysis.barDuration));
     const lastBar = Math.min(analysis.barCount, Math.ceil((end - origin) / analysis.barDuration));
     return average(analysis.barEnergy, firstBar, Math.max(1, lastBar - firstBar));
+  }
+
+  function vocalCutSafety(analysis, seconds) {
+    const activity = analysis.vocalActivity;
+    const step = analysis.vocalSecondsPerFrame;
+    if (!activity?.length || !step) return 0.5;
+    const center = Math.max(0, Math.min(activity.length - 1, Math.round(seconds / step)));
+    const centerRadius = Math.max(1, Math.round(0.11 / step));
+    const contextRadius = Math.max(centerRadius + 1, Math.round(0.85 / step));
+    let centerTotal = 0;
+    let centerCount = 0;
+    let contextTotal = 0;
+    let contextCount = 0;
+    for (let i = Math.max(0, center - contextRadius); i <= Math.min(activity.length - 1, center + contextRadius); i += 1) {
+      contextTotal += activity[i];
+      contextCount += 1;
+      if (Math.abs(i - center) <= centerRadius) {
+        centerTotal += activity[i];
+        centerCount += 1;
+      }
+    }
+    const centerMean = centerTotal / Math.max(1, centerCount);
+    const contextMean = contextTotal / Math.max(1, contextCount);
+    const relativeGap = Math.max(0, Math.min(1, 0.5 + (contextMean - centerMean) * 1.8));
+    const absoluteGap = 1 - Math.max(0, Math.min(1, centerMean));
+    return relativeGap * 0.68 + absoluteGap * 0.32;
+  }
+
+  function featureAtTime(analysis, seconds) {
+    const origin = analysis.barPhaseSeconds || 0;
+    const bar = Math.max(0, Math.min(analysis.barCount - 1, Math.floor((seconds - origin) / analysis.barDuration)));
+    const chroma = new Float32Array(12);
+    const base = bar * 12;
+    for (let c = 0; c < 12; c += 1) chroma[c] = analysis.barChroma[base + c];
+    return {
+      chroma,
+      energy: analysis.barEnergy[bar],
+      onset: analysis.barOnset[bar],
+      centroid: analysis.barCentroid[bar]
+    };
+  }
+
+  function transitionCompatibility(analysis, previousEnd, nextStart) {
+    if (!Number.isFinite(previousEnd)) return 0.7;
+    const before = featureAtTime(analysis, Math.max(0, previousEnd - analysis.beatDuration * 0.5));
+    const after = featureAtTime(analysis, nextStart + analysis.beatDuration * 0.5);
+    return frameSimilarity(before, after);
   }
 
   function chooseCandidateRanges(ranges, targetSeconds, analysis, strategy) {
@@ -834,10 +1018,37 @@
       remaining -= used;
       available = next;
     }
-    return allocations;
+    // 将每段长度量化到整拍，并用最大余数法分配剩余拍数。这样总长度最多只差一拍，
+    // 不需要在渲染阶段拉伸整首音频来凑时长。
+    const beat = analysis.beatDuration;
+    const capacities = ranges.map(range => Math.max(0, Math.floor((range.end - range.start) / beat)));
+    const targetBeats = Math.min(
+      capacities.reduce((sum, value) => sum + value, 0),
+      Math.max(ranges.length, Math.ceil(requestedDuration / beat))
+    );
+    const exact = allocations.map(value => value / beat);
+    const units = exact.map((value, index) => Math.min(capacities[index], Math.max(capacities[index] ? 1 : 0, Math.floor(value))));
+    let assigned = units.reduce((sum, value) => sum + value, 0);
+    const order = exact.map((value, index) => ({ index, remainder: value - Math.floor(value) }))
+      .sort((a, b) => b.remainder - a.remainder);
+    while (assigned < targetBeats) {
+      const candidate = order.find(item => units[item.index] < capacities[item.index]);
+      if (!candidate) break;
+      units[candidate.index] += 1;
+      assigned += 1;
+      candidate.remainder = -1;
+      order.sort((a, b) => b.remainder - a.remainder);
+    }
+    while (assigned > targetBeats) {
+      const candidate = [...order].reverse().find(item => units[item.index] > 1);
+      if (!candidate) break;
+      units[candidate.index] -= 1;
+      assigned -= 1;
+    }
+    return units.map((value, index) => value > 0 ? Math.min(ranges[index].end - ranges[index].start, value * beat) : 0);
   }
 
-  function chooseWindowInRange(range, duration, analysis, strategy, rangeIndex) {
+  function chooseWindowInRange(range, duration, analysis, strategy, rangeIndex, previousSegment = null) {
     const barDuration = analysis.barDuration;
     const origin = analysis.barPhaseSeconds || 0;
     const alignUp = time => origin + Math.ceil((time - origin - 0.01) / barDuration) * barDuration;
@@ -848,70 +1059,346 @@
     const gridStart = alignedEnd - alignedStart >= barDuration ? alignedStart : range.start;
     const gridEnd = alignedEnd - alignedStart >= barDuration ? alignedEnd : range.end;
     const capacity = gridEnd - gridStart;
-    const barCount = Math.max(1, Math.min(Math.floor(capacity / barDuration), Math.round(duration / barDuration)));
-    const alignedDuration = Math.min(capacity, barCount * barDuration);
+    const alignedDuration = Math.min(capacity, Math.max(analysis.beatDuration, duration));
     if (range.start < origin && origin > 0.01) {
       const musicalEnd = Math.min(gridEnd, Math.max(origin, alignNearest(range.start + duration)));
       return { start: range.start, end: musicalEnd };
     }
     if (alignedDuration >= capacity - 0.02) return { start: gridStart, end: gridEnd };
-    if (strategy === 'balanced') {
-      const rawStart = gridStart + (capacity - alignedDuration) * 0.5;
-      const start = alignNearest(rawStart);
-      return { start, end: Math.min(gridEnd, start + alignedDuration) };
-    }
-    if (strategy === 'smooth') {
-      const start = rangeIndex % 2 === 0 ? gridStart : gridEnd - alignedDuration;
-      return { start, end: start + alignedDuration };
-    }
-
-    const step = barDuration;
+    const step = analysis.beatDuration;
     let bestStart = gridStart;
-    let bestEnergy = -1;
+    let bestScore = -Infinity;
     for (let start = gridStart; start <= gridEnd - alignedDuration + 0.01; start += step) {
       const energy = rangeEnergy(analysis, start, start + alignedDuration);
-      if (energy > bestEnergy) {
-        bestEnergy = energy;
+      const center = start + alignedDuration * 0.5;
+      const rangeCenter = gridStart + capacity * 0.5;
+      const position = 1 - Math.min(1, Math.abs(center - rangeCenter) / Math.max(barDuration, capacity * 0.5));
+      const transition = transitionCompatibility(analysis, previousSegment?.end, start);
+      const startSafety = start <= 0.02 ? 1 : vocalCutSafety(analysis, start);
+      const endSafety = vocalCutSafety(analysis, start + alignedDuration);
+      const lyricSafety = Math.min(startSafety, endSafety);
+      const beatOffset = Math.abs(Math.round((start - origin) / analysis.beatDuration)) % (analysis.beatsPerBar || 4);
+      const phraseAlignment = beatOffset === 0 ? 1 : 0.55;
+      let score = lyricSafety * 0.42 + energy * 0.28 + transition * 0.22 + phraseAlignment * 0.08;
+      if (strategy === 'balanced') score = lyricSafety * 0.42 + transition * 0.28 + position * 0.2 + phraseAlignment * 0.1;
+      if (strategy === 'smooth') score = lyricSafety * 0.46 + transition * 0.38 + position * 0.1 + phraseAlignment * 0.06;
+      if (score > bestScore) {
+        bestScore = score;
         bestStart = start;
       }
     }
     return { start: bestStart, end: Math.min(gridEnd, bestStart + alignedDuration) };
   }
 
+  function chooseNarrativeArc(ranges, analysis, strategy) {
+    if (ranges.length < 4) return null;
+    const introIndex = Math.max(0, ranges.findIndex(range => range.type === 'intro'));
+    let outroIndex = -1;
+    for (let i = ranges.length - 1; i >= 0; i -= 1) {
+      if (ranges[i].type === 'outro') { outroIndex = i; break; }
+    }
+    if (outroIndex < 0) outroIndex = ranges.length - 1;
+    const verseIndexes = ranges.map((range, index) => range.type === 'verse' ? index : -1)
+      .filter(index => index > introIndex && index < outroIndex);
+    const chorusIndexes = ranges.map((range, index) => range.type === 'chorus' ? index : -1)
+      .filter(index => index > introIndex && index < outroIndex);
+    let middleIndexes = ranges.map((range, index) => ['interlude', 'bridge'].includes(range.type) ? index : -1)
+      .filter(index => index > introIndex && index < outroIndex);
+    if (!middleIndexes.length) {
+      middleIndexes = ranges.map((range, index) => !['intro', 'verse', 'chorus', 'outro'].includes(range.type) ? index : -1)
+        .filter(index => index > introIndex && index < outroIndex);
+    }
+    if (!verseIndexes.length || !chorusIndexes.length || !middleIndexes.length) return null;
+
+    let best = null;
+    for (const verseIndex of verseIndexes) {
+      for (const chorusIndex of chorusIndexes) {
+        if (chorusIndex <= verseIndex) continue;
+        for (const middleIndex of middleIndexes) {
+          if (middleIndex <= chorusIndex || middleIndex >= outroIndex) continue;
+          const indexes = [introIndex, verseIndex, chorusIndex, middleIndex, outroIndex];
+          const positions = indexes.map(index => index / Math.max(1, ranges.length - 1));
+          const idealVersePosition = strategy === 'balanced' ? 0.1 : strategy === 'smooth' ? 0.28 : 0.2;
+          const positionScore = 1 - (
+            Math.abs(positions[1] - idealVersePosition) + Math.abs(positions[2] - 0.43) + Math.abs(positions[3] - 0.65)
+          ) / 3;
+          const verseEnergy = rangeEnergy(analysis, ranges[verseIndex].start, ranges[verseIndex].end);
+          const chorusEnergy = rangeEnergy(analysis, ranges[chorusIndex].start, ranges[chorusIndex].end);
+          const middleEnergy = rangeEnergy(analysis, ranges[middleIndex].start, ranges[middleIndex].end);
+          const outroEnergy = rangeEnergy(analysis, ranges[outroIndex].start, ranges[outroIndex].end);
+          const energyArc = Math.max(0, Math.min(1, 0.55 + (chorusEnergy - verseEnergy) * 0.7
+            + (chorusEnergy - middleEnergy) * 0.25 + (middleEnergy - outroEnergy) * 0.2));
+          let transition = 0;
+          for (let i = 1; i < indexes.length; i += 1) {
+            transition += transitionCompatibility(analysis, ranges[indexes[i - 1]].end, ranges[indexes[i]].start);
+          }
+          transition /= indexes.length - 1;
+          let score = positionScore * 0.44 + energyArc * 0.34 + transition * 0.22;
+          if (strategy === 'energy') score = chorusEnergy * 0.38 + energyArc * 0.32 + positionScore * 0.2 + transition * 0.1;
+          if (strategy === 'smooth') score = transition * 0.48 + positionScore * 0.28 + energyArc * 0.24;
+          if (strategy === 'balanced' && verseIndex === verseIndexes[0]) score += 0.16;
+          if (strategy === 'smooth' && verseIndex === verseIndexes.filter(index => index < chorusIndex).at(-1)) score += 0.08;
+          if (!best || score > best.score) best = { score, indexes };
+        }
+      }
+    }
+    return best?.indexes || null;
+  }
+
+  function chooseNarrativeWindow(range, desiredDuration, analysis, strategy, role, previousSegment, bufferDuration) {
+    const barDuration = analysis.barDuration;
+    const origin = analysis.barPhaseSeconds || 0;
+    const alignUp = time => origin + Math.ceil((time - origin - 0.01) / barDuration) * barDuration;
+    const alignDown = time => origin + Math.floor((time - origin + 0.01) / barDuration) * barDuration;
+    // 前奏必须带上歌曲真正的开头，尾奏必须落到歌曲真正的结尾。中间段落才
+    // 使用检测到的小节网格收窄边界。
+    const gridStart = role === 'intro' ? range.start : Math.max(range.start, alignUp(range.start));
+    const gridEnd = role === 'outro' ? range.end : Math.min(range.end, alignDown(range.end));
+    const capacityBars = Math.floor((gridEnd - gridStart) / barDuration);
+    if (capacityBars < 2) return { start: range.start, end: range.end, role: range.role };
+
+    const vocalRole = role === 'verse' || role === 'chorus';
+    const unitBars = vocalRole ? 4 : 2;
+    // 主歌和副歌至少保留 8 小节，避免只拿半句话；前奏和尾奏至少 4 小节，
+    // 间奏可保留 2 小节作为呼吸。参考时长过短时宁可自然超出。
+    const preferredMinimum = vocalRole ? 8 : role === 'interlude' ? 2 : 4;
+    const minBars = Math.min(capacityBars, preferredMinimum);
+    const candidates = [];
+    for (let bars = minBars; bars <= capacityBars; bars += unitBars) {
+      const duration = bars * barDuration;
+      const starts = [];
+      if (role === 'intro') starts.push(gridStart);
+      else if (role === 'outro') starts.push(gridEnd - duration);
+      else for (let start = gridStart; start <= gridEnd - duration + 0.01; start += barDuration) starts.push(start);
+      for (const start of starts) {
+        const end = Math.min(gridEnd, start + duration);
+        const startNatural = Math.abs(start - range.start) < 0.08 || start <= 0.08;
+        const endNatural = Math.abs(end - range.end) < 0.08 || end >= bufferDuration - 0.08;
+        const startSafety = startNatural ? 0.72 : vocalCutSafety(analysis, start);
+        const endSafety = endNatural ? 0.72 : vocalCutSafety(analysis, end);
+        // 每一个被截短的片段都必须落在安静气口。间奏和尾奏也可能带和声或
+        // 尾句，不能因为标签看起来像“器乐段”就允许从持续发声处切开。
+        if (startSafety < 0.52 || endSafety < 0.52) continue;
+        const durationScore = Math.exp(-Math.abs(duration - desiredDuration) / Math.max(barDuration * 2, desiredDuration * 0.45));
+        const lyricSafety = Math.min(startSafety, endSafety);
+        const transition = previousSegment ? transitionCompatibility(analysis, previousSegment.end, start) : 0.75;
+        const energy = rangeEnergy(analysis, start, end);
+        let rolePosition = 0.7;
+        if (role === 'intro') rolePosition = 1 - (start - gridStart) / Math.max(barDuration, gridEnd - gridStart);
+        if (role === 'outro') rolePosition = 1 - (gridEnd - end) / Math.max(barDuration, gridEnd - gridStart);
+        if (role === 'verse' && strategy === 'balanced') rolePosition = 1 - (start - gridStart) / Math.max(barDuration, gridEnd - gridStart);
+        if (role === 'verse' && strategy === 'energy') rolePosition = (start - gridStart) / Math.max(barDuration, gridEnd - gridStart);
+        let score = durationScore * 0.34 + lyricSafety * 0.31 + transition * 0.2 + rolePosition * 0.1 + energy * 0.05;
+        if (strategy === 'energy' && role === 'chorus') score += energy * 0.12;
+        if (strategy === 'smooth') score += transition * 0.1;
+        candidates.push({ start, end, role: range.role, score });
+      }
+    }
+    if (!candidates.length) return { start: range.start, end: range.end, role: range.role };
+    candidates.sort((a, b) => b.score - a.score);
+    const chosen = candidates[0];
+    return { start: chosen.start, end: chosen.end, role: chosen.role };
+  }
+
+  function buildNarrativePlan(buffer, targetSeconds, analysis, strategy, ranges) {
+    const indexes = chooseNarrativeArc(ranges, analysis, strategy);
+    if (!indexes) return null;
+    const roles = ['intro', 'verse', 'chorus', 'interlude', 'outro'];
+    const weights = [0.14, 0.24, 0.3, 0.14, 0.18];
+    const segments = [];
+    indexes.forEach((rangeIndex, index) => {
+      const range = ranges[rangeIndex];
+      const previous = segments[segments.length - 1] || null;
+      const window = chooseNarrativeWindow(
+        range,
+        targetSeconds * weights[index],
+        analysis,
+        strategy,
+        roles[index],
+        previous,
+        buffer.duration
+      );
+      segments.push(window);
+    });
+
+    const merged = [];
+    for (const segment of segments) {
+      const previous = merged[merged.length - 1];
+      if (previous && segment.start - previous.end <= Math.max(0.08, analysis.beatDuration * 0.22)) {
+        previous.end = segment.end;
+        previous.role += `＋${segment.role}`;
+      } else {
+        merged.push({ ...segment });
+      }
+    }
+    const crossfadeSeconds = merged.length > 1 ? musicalCrossfade(analysis) : 0;
+    const naturalDuration = merged.reduce((sum, segment) => sum + segment.end - segment.start, 0)
+      - Math.max(0, merged.length - 1) * crossfadeSeconds;
+    const selectedEnergy = merged.reduce((sum, segment) => sum + rangeEnergy(analysis, segment.start, segment.end), 0) / Math.max(1, merged.length);
+    return {
+      strategy,
+      name: '候选方案',
+      description: '前奏—主歌—副歌—间奏—尾奏的完整迷你歌曲结构。',
+      requestedSeconds: targetSeconds,
+      targetSeconds: naturalDuration,
+      durationVarianceSeconds: naturalDuration - targetSeconds,
+      segments: merged,
+      cutCount: Math.max(0, merged.length - 1),
+      selectedEnergy,
+      targetBars: Math.max(1, Math.round(naturalDuration / analysis.barDuration)),
+      crossfadeSeconds,
+      cutMode: '五段叙事结构 · 完整歌词乐句 · A/B 轨交叉淡化',
+      transitionGainMatching: true,
+      narrativeArc: true
+    };
+  }
+
   function buildConstrainedPlan(buffer, targetSeconds, analysis, strategy, allowedRanges) {
     const ranges = normalizeAllowedRanges(buffer, allowedRanges);
     if (!ranges.length) throw new Error('请至少选择一个参与重编排的歌曲段落。');
+    const narrativePlan = buildNarrativePlan(buffer, targetSeconds, analysis, strategy, ranges);
+    if (narrativePlan) return narrativePlan;
     const availableDuration = ranges.reduce((sum, range) => sum + range.end - range.start, 0);
-    if (availableDuration + 0.05 < targetSeconds) {
-      throw new Error(`已选段落共 ${Math.round(availableDuration)} 秒，短于 ${Math.round(targetSeconds)} 秒的目标时长。请再选择一些段落或缩短目标时长。`);
+    const maxRanges = targetSeconds < 40 ? 4 : targetSeconds < 100 ? 6 : 8;
+    const tolerance = Math.max(analysis.barDuration * 4, targetSeconds * 0.18);
+    const lastIndex = ranges.length - 1;
+    let best = null;
+
+    const evaluate = indexes => {
+      const picked = indexes.map(index => ranges[index]);
+      const lastChorusIndex = [...indexes].reverse().find(index => ranges[index].type === 'chorus');
+      if (lastChorusIndex !== undefined) {
+        const chosen = new Set(indexes);
+        // 选到最后一次高潮后，就必须保留其后的连续过渡与尾奏；禁止再次跳切。
+        for (let index = lastChorusIndex + 1; index <= lastIndex; index += 1) {
+          if (!chosen.has(index)) return;
+        }
+      }
+      const rawDuration = picked.reduce((sum, range) => sum + range.end - range.start, 0);
+      if (availableDuration >= targetSeconds * 0.65 && rawDuration < targetSeconds * 0.65) return;
+      const durationDifference = Math.abs(rawDuration - targetSeconds);
+      const durationScore = Math.exp(-durationDifference / Math.max(1, tolerance));
+      const types = new Set(picked.map(range => range.type));
+      const hasVerse = types.has('verse');
+      const hasChorus = types.has('chorus');
+      const hasEnding = types.has('outro') || picked[picked.length - 1].end >= buffer.duration - 0.2;
+      const narrative = (hasVerse ? 0.28 : 0) + (hasChorus ? 0.36 : 0)
+        + (hasEnding ? 0.26 : 0) + (types.has('intro') ? 0.1 : 0);
+      let transitionTotal = 0;
+      let dynamicTotal = 0;
+      let safetyTotal = 0;
+      let adjacencyCount = 0;
+      for (let i = 0; i < picked.length; i += 1) {
+        const range = picked[i];
+        safetyTotal += Math.min(vocalCutSafety(analysis, range.start), vocalCutSafety(analysis, range.end));
+        if (i === 0) continue;
+        const previous = picked[i - 1];
+        const adjacent = range.start - previous.end <= Math.max(0.08, analysis.beatDuration * 0.22);
+        const joinSafety = Math.min(vocalCutSafety(analysis, previous.end), vocalCutSafety(analysis, range.start));
+        // 非连续片段的两侧只要仍有明显人声，就直接淘汰该方案。
+        // 宁可让成片时长浮动，也不能用淡化掩盖半句歌词被截断的问题。
+        if (!adjacent && joinSafety < 0.52) return;
+        if (adjacent) adjacencyCount += 1;
+        transitionTotal += Math.min(1, transitionCompatibility(analysis, previous.end, range.start) + (adjacent ? 0.28 : 0));
+        const beforeEnergy = rangeEnergy(analysis, previous.start, previous.end);
+        const afterEnergy = rangeEnergy(analysis, range.start, range.end);
+        const drop = Math.max(0, beforeEnergy - afterEnergy);
+        // 高潮到低能尾奏只有在原曲本来连续时才自然；跨段跳过去要重罚。
+        const dropPenalty = drop * (range.type === 'outro' && !adjacent ? 1.8 : 0.9);
+        dynamicTotal += Math.max(0, 1 - dropPenalty);
+      }
+      const joins = Math.max(1, picked.length - 1);
+      const transition = picked.length > 1 ? transitionTotal / joins : 0.65;
+      const dynamics = picked.length > 1 ? dynamicTotal / joins : 0.65;
+      const safety = safetyTotal / Math.max(1, picked.length);
+      const adjacency = adjacencyCount / joins;
+      const artificialCuts = Math.max(0, picked.length - 1 - adjacencyCount);
+      const meanEnergy = picked.reduce((sum, range) => sum + rangeEnergy(analysis, range.start, range.end), 0) / picked.length;
+      let score;
+      if (strategy === 'energy') {
+        score = durationScore * 0.3 + narrative * 0.24 + transition * 0.17
+          + dynamics * 0.12 + meanEnergy * 0.12 + adjacency * 0.05;
+        if (picked[0]?.type === 'chorus') score += 0.08;
+        if (artificialCuts === 0 && rawDuration >= targetSeconds) score += 0.13;
+      } else if (strategy === 'smooth') {
+        score = transition * 0.24 + dynamics * 0.18 + adjacency * 0.28
+          + safety * 0.1 + durationScore * 0.1 + narrative * 0.06;
+        if (adjacency >= 0.99) score += 0.14;
+        if (artificialCuts === 0) score += 0.08;
+      } else {
+        score = durationScore * 0.38 + narrative * 0.25 + transition * 0.16
+          + dynamics * 0.1 + safety * 0.07 + adjacency * 0.04;
+        if (picked[0]?.type === 'verse') score += 0.2;
+        score -= artificialCuts * 0.075;
+        if (picked[0] && picked[0].end - picked[0].start < analysis.barDuration * 6) score -= 0.09;
+        if (artificialCuts === 0) score += 0.11;
+      }
+      const preferredCount = strategy === 'energy' ? 3 : strategy === 'smooth' ? 5 : 4;
+      score -= Math.abs(picked.length - preferredCount) * 0.012;
+      // 超出参考时长很多仍可候选，但必须有显著更好的叙事与衔接才会胜出。
+      if (durationDifference > Math.max(tolerance * 2.2, targetSeconds * 0.42)) score -= 0.3;
+      if (!best || score > best.score) best = { score, indexes, picked, rawDuration };
+    };
+
+    // 结尾必须来自用户允许范围中的最后一个完整段落；此前最多选择若干完整乐段。
+    // 组合数在常见的 8–16 个段落下很小，能换来比贪心截断稳定得多的结构。
+    let searchPool = ranges.slice(0, lastIndex).map((_, index) => index);
+    if (searchPool.length > 15) {
+      const kept = new Set([0, 1, lastIndex - 1, lastIndex - 2, lastIndex - 3].filter(index => index >= 0));
+      const ranked = searchPool
+        .filter(index => !kept.has(index))
+        .map(index => ({
+          index,
+          score: (ranges[index].type === 'chorus' ? 1 : ranges[index].type === 'verse' ? 0.7 : 0.35)
+            + rangeEnergy(analysis, ranges[index].start, ranges[index].end) * 0.45
+        }))
+        .sort((a, b) => b.score - a.score);
+      ranked.slice(0, 15 - kept.size).forEach(item => kept.add(item.index));
+      searchPool = [...kept].sort((a, b) => a - b);
+    }
+    const choose = (from, remaining, current) => {
+      evaluate([...current, lastIndex]);
+      if (remaining <= 0) return;
+      for (let position = from; position < searchPool.length; position += 1) {
+        const index = searchPool[position];
+        current.push(index);
+        choose(position + 1, remaining - 1, current);
+        current.pop();
+      }
+    };
+    choose(0, Math.max(0, maxRanges - 1), []);
+
+    const selected = best?.picked || [ranges[lastIndex]];
+    const segments = [];
+    for (const range of selected) {
+      const previous = segments[segments.length - 1];
+      const adjacent = previous && range.start - previous.end <= Math.max(0.08, analysis.beatDuration * 0.22);
+      if (adjacent) {
+        // 保留原曲里本来就连续的“高潮→过渡→尾奏”，不在中间制造人工接点。
+        previous.end = range.end;
+        previous.role += `＋${range.role}`;
+      } else {
+        segments.push({ start: range.start, end: range.end, role: range.role });
+      }
     }
 
-    const candidateRanges = chooseCandidateRanges(ranges, targetSeconds, analysis, strategy);
-    const expectedCuts = Math.max(0, candidateRanges.length - 1);
-    const crossfadeSeconds = Math.max(0.18, Math.min(0.75, analysis.beatDuration));
-    const requestedDuration = Math.min(availableDuration, targetSeconds + expectedCuts * crossfadeSeconds);
-    const allocations = allocateDurations(candidateRanges, requestedDuration, analysis, strategy);
-    const segments = candidateRanges
-      .map((range, index) => {
-        if (allocations[index] < 0.2) return null;
-        const window = chooseWindowInRange(range, allocations[index], analysis, strategy, index);
-        return { ...window, role: range.role };
-      })
-      .filter(Boolean)
-      .sort((a, b) => a.start - b.start);
-
+    const crossfadeSeconds = segments.length > 1 ? musicalCrossfade(analysis) : 0;
+    const naturalDuration = segments.reduce((sum, segment) => sum + segment.end - segment.start, 0)
+      - Math.max(0, segments.length - 1) * crossfadeSeconds;
     const selectedEnergy = segments.reduce((sum, segment) => sum + rangeEnergy(analysis, segment.start, segment.end), 0) / Math.max(1, segments.length);
     return {
       strategy,
       name: '候选方案',
-      description: '仅使用用户选中的原曲段落。',
-      targetSeconds,
+      description: '以参考时长为中心，优先保留完整乐句与自然收束。',
+      requestedSeconds: targetSeconds,
+      targetSeconds: naturalDuration,
+      durationVarianceSeconds: naturalDuration - targetSeconds,
       segments,
       cutCount: Math.max(0, segments.length - 1),
       selectedEnergy,
-      targetBars: Math.max(1, Math.round(targetSeconds / analysis.barDuration)),
+      targetBars: Math.max(1, Math.round(naturalDuration / analysis.barDuration)),
       crossfadeSeconds,
-      cutMode: '小节对齐 · 整拍交叉衔接',
+      cutMode: '完整乐段优先 · 自然时长浮动 · A/B 轨交叉淡化',
       transitionGainMatching: true
     };
   }
@@ -939,8 +1426,10 @@
     const radius = Math.max(1, Math.round(sampleRate * 0.008));
     const rawStart = Math.max(0, Math.floor(segment.start * sampleRate));
     const rawEnd = Math.min(buffer.length, Math.ceil(segment.end * sampleRate));
-    const startFrame = rawStart === 0 ? 0 : findQuietCrossing(guide, rawStart, radius);
-    const endFrame = rawEnd === buffer.length ? buffer.length : findQuietCrossing(guide, rawEnd, radius);
+    const plannedLength = Math.max(0, rawEnd - rawStart);
+    let startFrame = rawStart === 0 ? 0 : findQuietCrossing(guide, rawStart, radius);
+    let endFrame = Math.min(buffer.length, startFrame + plannedLength);
+    if (endFrame - startFrame < plannedLength) startFrame = Math.max(0, endFrame - plannedLength);
     const length = Math.max(0, endFrame - startFrame);
     const count = Math.min(buffer.numberOfChannels, 2);
     const channels = [];
@@ -950,7 +1439,7 @@
 
   function stitchSegments(buffer, plan) {
     const pieces = plan.segments.map(segment => copySegment(buffer, segment));
-    const crossfadeFrames = Math.round(buffer.sampleRate * (plan.crossfadeSeconds || 0.12));
+    const crossfadeFrames = Math.round(buffer.sampleRate * (plan.crossfadeSeconds ?? 0.12));
     let totalLength = pieces.reduce((sum, piece) => sum + piece.length, 0);
     for (let i = 1; i < pieces.length; i += 1) totalLength -= Math.min(crossfadeFrames, pieces[i - 1].length, pieces[i].length);
     const channelCount = Math.min(buffer.numberOfChannels, 2);
@@ -995,19 +1484,70 @@
     return output.map(channel => channel.subarray(0, cursor));
   }
 
-  function resampleToExactLength(channels, targetLength) {
+  function trimPlanToTarget(plan, analysis) {
+    const segments = plan.segments.map(segment => ({ ...segment }));
+    const overlap = Math.max(0, plan.crossfadeSeconds || 0);
+    let renderedDuration = segments.reduce((sum, segment) => sum + segment.end - segment.start, 0)
+      - Math.max(0, segments.length - 1) * overlap;
+    let excess = Math.max(0, renderedDuration - plan.targetSeconds);
+    // 任意目标时长不一定正好落在整拍上。旧实现总是截短最后一段，可能正好切在一句歌词中间。
+    // 现在会在所有片段的头尾中寻找“移动同样时长以后最像歌词气口”的那个接点。
+    if (excess > 1e-4) {
+      const options = [];
+      segments.forEach((segment, index) => {
+        if (segment.end - segment.start - excess < 0.2) return;
+        const shortenedEnd = segment.end - excess;
+        options.push({
+          index,
+          edge: 'end',
+          score: vocalCutSafety(analysis, shortenedEnd) * 0.78 + vocalCutSafety(analysis, segment.start) * 0.22
+        });
+        const advancedStart = segment.start + excess;
+        options.push({
+          index,
+          edge: 'start',
+          score: vocalCutSafety(analysis, advancedStart) * 0.78 + vocalCutSafety(analysis, segment.end) * 0.22
+        });
+      });
+      options.sort((a, b) => b.score - a.score);
+      const best = options[0];
+      if (best) {
+        if (best.edge === 'end') segments[best.index].end -= excess;
+        else segments[best.index].start += excess;
+        renderedDuration -= excess;
+        excess = 0;
+      }
+    }
+    // 极短片段等异常输入的保底逻辑。
+    for (let index = segments.length - 1; index >= 0 && excess > 1e-4; index -= 1) {
+      const duration = segments[index].end - segments[index].start;
+      const reducible = Math.max(0, duration - 0.2);
+      const amount = Math.min(reducible, excess);
+      segments[index].end -= amount;
+      excess -= amount;
+      renderedDuration -= amount;
+    }
+    const joinSafeties = [];
+    segments.forEach((segment, index) => {
+      if (index > 0) joinSafeties.push(vocalCutSafety(analysis, segment.start));
+      if (index < segments.length - 1) joinSafeties.push(vocalCutSafety(analysis, segment.end));
+    });
+    return {
+      ...plan,
+      segments,
+      lyricSafety: joinSafeties.length ? Math.min(...joinSafeties) : vocalCutSafety(analysis, segments[0]?.end || 0),
+      lyricsProtected: true
+    };
+  }
+
+  function fitToExactLength(channels, targetLength) {
     const sourceLength = channels[0].length;
     if (sourceLength === targetLength) return channels;
-    const ratio = (sourceLength - 1) / Math.max(1, targetLength - 1);
+    if (sourceLength > targetLength) return channels.map(source => source.slice(0, targetLength));
+    // 正常规划会多留不足一拍的余量；这里仅是容错，不进行会改变速度和音高的重采样。
     return channels.map(source => {
       const output = new Float32Array(targetLength);
-      for (let i = 0; i < targetLength; i += 1) {
-        const position = i * ratio;
-        const left = Math.floor(position);
-        const right = Math.min(sourceLength - 1, left + 1);
-        const fraction = position - left;
-        output[i] = source[left] * (1 - fraction) + source[right] * fraction;
-      }
+      output.set(source, 0);
       return output;
     });
   }
@@ -1030,6 +1570,23 @@
     if (peak <= 0 || peak <= 0.96) return;
     const gain = 0.96 / peak;
     for (const channel of channels) for (let i = 0; i < channel.length; i += 1) channel[i] *= gain;
+  }
+
+  function buildWaveformPeaks(channels, pointCount = 1800) {
+    const length = channels[0]?.length || 0;
+    const count = Math.max(1, Math.min(pointCount, length));
+    const peaks = new Float32Array(count);
+    for (let point = 0; point < count; point += 1) {
+      const from = Math.floor((point / count) * length);
+      const to = Math.max(from + 1, Math.floor(((point + 1) / count) * length));
+      const stride = Math.max(1, Math.floor((to - from) / 48));
+      let peak = 0;
+      for (let frame = from; frame < to; frame += stride) {
+        for (const channel of channels) peak = Math.max(peak, Math.abs(channel[frame] || 0));
+      }
+      peaks[point] = peak;
+    }
+    return peaks;
   }
 
   function encodeWav(channels, sampleRate) {
@@ -1066,25 +1623,28 @@
     return new Uint8Array(buffer);
   }
 
-  async function renderPlan(buffer, plan, progress = () => {}) {
-    let channels = stitchSegments(buffer, plan);
+  async function renderPlan(buffer, plan, analysis, progress = () => {}) {
+    const renderedPlan = trimPlanToTarget(plan, analysis);
+    let channels = stitchSegments(buffer, renderedPlan);
     progress(62, '正在构建候选方案…');
     const targetLength = Math.max(1, Math.round(plan.targetSeconds * buffer.sampleRate));
-    channels = resampleToExactLength(channels, targetLength);
+    channels = fitToExactLength(channels, targetLength);
     applyMasterFade(channels, buffer.sampleRate);
     normalize(channels);
+    const waveformPeaks = buildWaveformPeaks(channels);
     const wavBytes = encodeWav(channels, buffer.sampleRate);
     return {
-      ...plan,
+      ...renderedPlan,
       bpm: null,
+      waveformPeaks,
       wavBytes,
       blob: new Blob([wavBytes], { type: 'audio/wav' })
     };
   }
 
   async function process(buffer, targetSeconds, requestedStrategy, progress = () => {}, precomputedAnalysis = null, allowedRanges = null) {
-    if (targetSeconds < 8) throw new Error('目标时长至少需要 8 秒。');
-    if (targetSeconds >= buffer.duration - 1) throw new Error('目标时长需要短于原曲至少 1 秒。');
+    if (targetSeconds < 8) throw new Error('参考时长至少需要 8 秒。');
+    if (targetSeconds >= buffer.duration - 1) throw new Error('参考时长需要短于原曲至少 1 秒。');
     progress(3, '读取音频波形…');
     await new Promise(resolve => setTimeout(resolve, 30));
     const analysis = precomputedAnalysis || await analyzeRhythm(buffer, progress);
@@ -1097,7 +1657,7 @@
         : buildPlan(buffer, targetSeconds, analysis, strategy);
       const base = 46 + (i / strategies.length) * 48;
       progress(base, `正在生成方案 ${String.fromCharCode(65 + i)}…`);
-      const result = await renderPlan(buffer, plan, progress);
+      const result = await renderPlan(buffer, plan, analysis, progress);
       result.bpm = analysis.bpm;
       result.barDuration = analysis.barDuration;
       results.push(result);

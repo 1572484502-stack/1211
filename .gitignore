@@ -1,4 +1,5 @@
 node_modules/
+.workbuddy/
 *.log
 *.tmp
 *.temp

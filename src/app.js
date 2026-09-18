@@ -305,6 +305,7 @@
     $('#metricBpm').textContent = analysis.bpm.toFixed(0);
     $('#metricDuration').textContent = formatTime(buffer.duration);
     $('#metricBars').textContent = analysis.barCount;
+    $('#metricMeter').textContent = `按 ${analysis.beatsPerBar || 4}/4 拍估计`;
     $('#metricChannels').textContent = buffer.numberOfChannels > 1 ? '立体声' : '单声道';
     $('#metricSampleRate').textContent = `${(buffer.sampleRate / 1000).toFixed(1)} kHz 采样率`;
     $('#trackDuration').textContent = formatTime(buffer.duration);
@@ -541,33 +542,93 @@
     if (!canvas || !state.buffer) return;
     const { ctx, width, height } = prepareWaveCanvas(canvas);
     const data = state.buffer.getChannelData(0);
-    const total = result.segments.reduce((sum, segment) => sum + segment.end - segment.start, 0) || 1;
+    const total = Math.max(0.001, result.targetSeconds);
+    const overlap = Math.max(0, result.crossfadeSeconds || 0);
     const center = height / 2;
-    let cursor = 0;
     ctx.fillStyle = '#f8f6ff';
     ctx.fillRect(0, 0, width, height);
 
+    // 音频拼接时后一段会提前 overlap 秒进入，因此不能再按原片段时长
+    // 简单首尾相接。这里构造与 stitchSegments 完全一致的成品时间线。
+    const placements = [];
+    let outputCursor = 0;
     result.segments.forEach((segment, index) => {
-      const segmentWidth = ((segment.end - segment.start) / total) * width;
-      const xEnd = index === result.segments.length - 1 ? width : cursor + segmentWidth;
+      const duration = Math.max(0, segment.end - segment.start);
+      const outputStart = index === 0 ? 0 : Math.max(0, outputCursor - overlap);
+      const outputEnd = Math.min(total, outputStart + duration);
+      placements.push({ segment, outputStart, outputEnd });
+      outputCursor = outputEnd;
+    });
+
+    const renderedPeaks = result.waveformPeaks;
+    const strokeRenderedRange = (timeStart, timeEnd, color) => {
+      const xStart = (timeStart / total) * width;
+      const xEnd = (timeEnd / total) * width;
+      const pixelWidth = Math.max(1, Math.floor(xEnd - xStart));
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let pixel = 0; pixel < pixelWidth; pixel += 1) {
+        const globalX = xStart + pixel + 0.5;
+        const peakIndex = Math.max(0, Math.min(renderedPeaks.length - 1, Math.floor((globalX / width) * renderedPeaks.length)));
+        const value = Math.max(1, (renderedPeaks[peakIndex] || 0) * height * .38);
+        ctx.moveTo(globalX, center - value);
+        ctx.lineTo(globalX, center + value);
+      }
+      ctx.stroke();
+    };
+
+    placements.forEach((placement, index) => {
+      const { segment } = placement;
+      const ownershipStart = index === 0 ? 0 : placement.outputStart + overlap * 0.5;
+      const next = placements[index + 1];
+      const ownershipEnd = next ? next.outputStart + overlap * 0.5 : total;
+      const xStart = (ownershipStart / total) * width;
+      const xEnd = (ownershipEnd / total) * width;
       const section = sectionForTime(segment.start);
       const color = typeColors[section?.type] || '#7e7ce6';
       ctx.fillStyle = `${color}20`;
-      ctx.fillRect(cursor, 0, Math.max(2, xEnd - cursor), height);
-      strokeWaveRange(ctx, data, state.buffer.sampleRate, segment.start, segment.end, cursor, xEnd, center, height * .36, color);
-      if (index > 0) {
-        const overlapWidth = Math.max(5, (result.crossfadeSeconds / result.targetSeconds) * width);
-        ctx.fillStyle = 'rgba(255,255,255,.78)';
-        ctx.fillRect(cursor - overlapWidth / 2, 0, overlapWidth, height);
-        ctx.strokeStyle = '#7c3cff';
-        ctx.setLineDash([3, 3]);
-        ctx.beginPath(); ctx.moveTo(cursor, 0); ctx.lineTo(cursor, height); ctx.stroke();
-        ctx.setLineDash([]);
-      }
+      ctx.fillRect(xStart, 0, Math.max(2, xEnd - xStart), height);
       ctx.fillStyle = color;
       ctx.font = '700 10px "Microsoft YaHei UI"';
-      ctx.fillText(`${index + 1} ${segment.role}`, cursor + 6, height - 7);
-      cursor = xEnd;
+      ctx.fillText(`${index + 1} ${segment.role}`, xStart + 6, height - 7);
+    });
+
+    // 真正渲染后的成品峰值按所属片段着色，峰形与播放器时间完全一致。
+    if (renderedPeaks?.length) {
+      placements.forEach((placement, index) => {
+        const ownershipStart = index === 0 ? 0 : placement.outputStart + overlap * 0.5;
+        const next = placements[index + 1];
+        const ownershipEnd = next ? next.outputStart + overlap * 0.5 : total;
+        const section = sectionForTime(placement.segment.start);
+        strokeRenderedRange(ownershipStart, ownershipEnd, typeColors[section?.type] || '#7e7ce6');
+      });
+    } else {
+      // 兼容页面刷新前已经存在的旧结果。
+      placements.forEach(placement => {
+        const section = sectionForTime(placement.segment.start);
+        strokeWaveRange(ctx, data, state.buffer.sampleRate, placement.segment.start, placement.segment.end,
+          (placement.outputStart / total) * width, (placement.outputEnd / total) * width,
+          center, height * .36, typeColors[section?.type] || '#7e7ce6');
+      });
+    }
+
+    placements.slice(1).forEach((placement, index) => {
+      const previous = placements[index];
+      const overlapStartX = (placement.outputStart / total) * width;
+      const overlapEndX = ((placement.outputStart + overlap) / total) * width;
+      const previousColor = typeColors[sectionForTime(previous.segment.start)?.type] || '#7e7ce6';
+      const currentColor = typeColors[sectionForTime(placement.segment.start)?.type] || '#7e7ce6';
+      const gradient = ctx.createLinearGradient(overlapStartX, 0, overlapEndX, 0);
+      gradient.addColorStop(0, `${previousColor}30`);
+      gradient.addColorStop(1, `${currentColor}30`);
+      ctx.fillStyle = gradient;
+      ctx.fillRect(overlapStartX, 0, Math.max(2, overlapEndX - overlapStartX), height);
+      const joinX = (overlapStartX + overlapEndX) * 0.5;
+      ctx.strokeStyle = '#7c3cff';
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(joinX, 0); ctx.lineTo(joinX, height); ctx.stroke();
+      ctx.setLineDash([]);
     });
 
     const playheadX = Math.max(0, Math.min(width, (currentTime / Math.max(.001, result.targetSeconds)) * width));
@@ -654,9 +715,14 @@
       const card = document.createElement('article');
       card.className = `result-card ${index === 0 ? 'recommended' : ''}`;
       const selectedCount = selectedRanges().length;
+      const lyricTag = result.cutCount === 0 ? '无人工歌词接点' : '歌词气口校验通过';
+      const requestedSeconds = result.requestedSeconds || result.targetSeconds;
+      const durationTag = Math.abs(result.targetSeconds - requestedSeconds) < 0.75
+        ? '接近参考时长'
+        : `参考 ${formatTime(requestedSeconds)} · 自然成片 ${formatTime(result.targetSeconds)}`;
       card.innerHTML = `
         <div class="result-top"><span class="result-letter">${String.fromCharCode(65 + index)}</span><div class="result-title"><strong>方案 ${String.fromCharCode(65 + index)} · ${formatTime(result.targetSeconds)}</strong><small>${result.cutCount} 处衔接 · 约 ${result.bpm} BPM</small></div>${index === 0 ? '<span class="recommend-tag">推荐先试听</span>' : ''}</div>
-        <div class="result-tags"><span>目标时长已对齐</span><span>强拍对齐切割</span><span>4/8 小节乐句结构</span><span>${result.crossfadeSeconds.toFixed(2)} 秒整拍衔接</span><span>接点响度匹配</span><span>参与范围 ${selectedCount} 段</span></div>
+        <div class="result-tags"><span>${durationTag}</span><span>${result.narrativeArc ? '前奏 → 主歌 → 副歌 → 间奏 → 尾奏' : '完整乐段优先'}</span><span>${lyricTag}</span><span>${result.crossfadeSeconds.toFixed(2)} 秒 A/B 轨交叉淡化</span><span>和声与动态接点匹配</span><span>参与范围 ${selectedCount} 段</span></div>
         <div class="wave-compare">
           <div class="result-wave-row"><div class="result-wave-label"><strong>原曲取段</strong><small>灰色为舍弃，彩色为采用</small></div><canvas class="result-source-wave" height="72"></canvas></div>
           <div class="result-wave-row"><div class="result-wave-label"><strong>拼接结果</strong><small>虚线为衔接点，点击或拖动可跳转</small></div><canvas class="result-output-wave" height="72" tabindex="0" role="slider" aria-label="试听进度，点击或拖动跳转" aria-valuemin="0" aria-valuemax="${Math.round(result.targetSeconds)}" aria-valuenow="0"></canvas></div>

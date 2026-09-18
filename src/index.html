@@ -43,7 +43,7 @@
             <div class="workflow-tabs">
               <button id="analysisTab" class="workflow-tab active" data-panel="analysis"><span class="tab-icon">▥</span><strong>段落分析</strong><small>识别节拍与结构</small></button>
               <div class="tab-line"><i></i></div>
-              <button id="retargetTab" class="workflow-tab" data-panel="retarget"><span class="tab-icon">↔</span><strong>时长重塑</strong><small>生成指定长度版本</small></button>
+              <button id="retargetTab" class="workflow-tab" data-panel="retarget"><span class="tab-icon">↔</span><strong>时长重塑</strong><small>按参考时长自然编排</small></button>
             </div>
             <div id="fileBar" class="file-bar hidden">
               <div class="file-icon">♪</div>
@@ -70,7 +70,7 @@
               <div class="metric-grid">
                 <article><span>BPM</span><strong id="metricBpm" class="purple">—</strong><small>每分钟节拍</small></article>
                 <article><span>歌曲时长</span><strong id="metricDuration" class="orange">—</strong><small>分 : 秒</small></article>
-                <article><span>估计小节</span><strong id="metricBars" class="blue">—</strong><small>按四拍小节计算</small></article>
+                <article><span>估计小节</span><strong id="metricBars" class="blue">—</strong><small id="metricMeter">自动估计拍号</small></article>
                 <article><span>音频声道</span><strong id="metricChannels" class="cyan">—</strong><small id="metricSampleRate">采样率</small></article>
               </div>
 
@@ -98,14 +98,14 @@
 
             <div id="retargetPanel" class="view-panel hidden">
               <article class="target-card">
-                <div><span class="section-kicker">TARGET DURATION</span><h2>设定目标时长</h2><p>输入任意长度，系统会按自然小节生成多个候选版本。</p></div>
+                <div><span class="section-kicker">REFERENCE DURATION</span><h2>设定参考时长</h2><p>系统优先保留完整乐句和自然结尾，成片时长允许在参考值附近浮动。</p></div>
                 <div class="duration-control"><label><input id="targetMinutes" type="number" min="0" max="59" value="1" /><span>分</span></label><b>:</b><label><input id="targetSeconds" type="number" min="0" max="59" value="0" /><span>秒</span></label></div>
                 <div class="preset-row"><button data-seconds="30">30 秒</button><button data-seconds="60" class="active">1 分钟</button><button data-seconds="90">1分30秒</button><button data-seconds="120">2 分钟</button></div>
                 <button id="analyzeBtn" class="generate-btn"><span>✦</span><strong>生成候选方案</strong><small>一次生成三个版本</small></button>
               </article>
 
               <article class="retarget-map">
-                <div class="card-toolbar compact"><div><span class="section-kicker">SOURCE MAP</span><h2>参与编排的原曲段落</h2><p class="map-help">彩色段落将参与生成，浅灰段落会被排除。点击色块仍可调整选择。</p></div><span class="duration-summary">原曲 <b id="sourceDurationLabel">—</b> · 目标 <b id="targetDurationLabel">01:00</b></span></div>
+                <div class="card-toolbar compact"><div><span class="section-kicker">SOURCE MAP</span><h2>参与编排的原曲段落</h2><p class="map-help">彩色段落将参与生成，浅灰段落会被排除。点击色块仍可调整选择。</p></div><span class="duration-summary">原曲 <b id="sourceDurationLabel">—</b> · 参考 <b id="targetDurationLabel">01:00</b></span></div>
                 <canvas id="retargetWaveform" height="110"></canvas>
                 <div id="retargetSegmentBand" class="segment-band slim"></div>
               </article>
