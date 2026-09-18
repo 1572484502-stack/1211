@@ -3,7 +3,10 @@
   const $$ = selector => [...document.querySelectorAll(selector)];
   const state = { file: null, buffer: null, analysis: null, sections: [], sourceUrl: null, resultUrls: [], results: [] };
   const HISTORY_KEY = 'history.v1';
-  const typeColors = { verse: '#7e7ce6', lift: '#b16eed', chorus: '#ef6868', outro: '#8996a8' };
+  const SECTION_TYPES = window.VistaAudio.SECTION_TYPES;
+  const typeColors = Object.fromEntries(
+    Object.entries(SECTION_TYPES).map(([type, definition]) => [type, definition.color])
+  );
 
   const dropZone = $('#dropZone');
   const fileInput = $('#fileInput');
@@ -113,6 +116,13 @@
   $('#analysisTab').addEventListener('click', () => switchPanel('analysis'));
   $('#retargetTab').addEventListener('click', () => switchPanel('retarget'));
   $('#goRetargetBtn').addEventListener('click', () => switchPanel('retarget'));
+  $('#editSegmentsBtn').addEventListener('click', () => {
+    const editor = $('#segmentEditor');
+    const willShow = editor.classList.contains('hidden');
+    editor.classList.toggle('hidden', !willShow);
+    $('#editSegmentsBtn').classList.toggle('active', willShow);
+    if (willShow) renderSegmentEditor();
+  });
   $('#historyBtn').addEventListener('click', () => setHistoryOpen(true));
   $('#closeHistoryBtn').addEventListener('click', () => setHistoryOpen(false));
   $('#drawerBackdrop').addEventListener('click', () => setHistoryOpen(false));
@@ -123,45 +133,61 @@
     showToast('历史记录已清空。');
   });
 
-  function buildSections(analysis, duration) {
-    const barsPerSection = duration > 150 ? 8 : 4;
-    const phraseDuration = analysis.barDuration * barsPerSection;
-    const origin = analysis.barPhaseSeconds || 0;
-    const sections = [];
-    let start = 0;
-    let end = Math.min(duration, Math.max(phraseDuration, origin + phraseDuration));
-    while (start < duration - 0.05) {
-      const startBar = Math.max(0, Math.floor((start - origin) / analysis.barDuration));
-      const endBar = Math.min(analysis.barCount, Math.ceil((end - origin) / analysis.barDuration));
-      let energy = 0;
-      for (let i = startBar; i < endBar; i += 1) energy += analysis.barEnergy[i] || 0;
-      energy /= Math.max(1, endBar - startBar);
-      const progress = start / duration;
-      let type = 'verse';
-      let label = '主歌';
-      if (sections.length === 0) label = '前奏';
-      else if (progress > .84) { type = 'outro'; label = '尾奏'; }
-      else if (energy > .72) { type = 'chorus'; label = '高潮'; }
-      else if (energy > .49) { type = 'lift'; label = '推进'; }
-      else if (energy < .3) label = '间奏';
-      sections.push({
-        start,
-        end,
-        type,
-        label,
-        energy,
-        selected: true
+  function relabelSection(index, type) {
+    const section = state.sections[index];
+    if (!section) return;
+    section.type = type;
+    const sameType = state.sections.filter(item => item.type === type);
+    const repeatable = type === 'verse' || type === 'chorus' || type === 'prechorus' || type === 'interlude';
+    const position = sameType.indexOf(section) + 1;
+    section.label = `${SECTION_TYPES[type].label}${repeatable && sameType.length > 1 ? position : ''}`;
+    syncSelectionUI();
+    renderSegmentEditor();
+  }
+
+  function renderSegmentEditor() {
+    const list = $('#segmentEditorList');
+    if (!list) return;
+    list.replaceChildren();
+    state.sections.forEach((section, index) => {
+      const row = document.createElement('div');
+      row.className = 'segment-editor-row';
+      const time = document.createElement('button');
+      time.type = 'button';
+      time.className = `segment-editor-time ${section.type}`;
+      time.textContent = `${formatTime(section.start)}–${formatTime(section.end)}`;
+      time.title = '点击试听这一段';
+      time.addEventListener('click', () => previewSection(section));
+      const select = document.createElement('select');
+      select.className = 'segment-editor-select';
+      Object.entries(SECTION_TYPES).forEach(([type, definition]) => {
+        const option = document.createElement('option');
+        option.value = type;
+        option.textContent = definition.label;
+        option.selected = type === section.type;
+        select.appendChild(option);
       });
-      start = end;
-      end = Math.min(duration, end + phraseDuration);
-    }
-    if (sections.length) {
-      sections[0].start = 0;
-      sections[sections.length - 1].end = duration;
-      sections[sections.length - 1].type = 'outro';
-      sections[sections.length - 1].label = '尾奏';
-    }
-    return sections;
+      select.addEventListener('change', () => relabelSection(index, select.value));
+      const meter = document.createElement('span');
+      meter.className = 'segment-editor-meter';
+      meter.textContent = `能量 ${Math.round(section.energy * 100)}%`;
+      row.append(time, select, meter);
+      list.appendChild(row);
+    });
+  }
+
+  function previewSection(section) {
+    if (!state.buffer) return;
+    sourceAudio.currentTime = Math.max(0, section.start);
+    window.VistaMedia.playExclusive(sourceAudio);
+    const stopAt = () => {
+      if (sourceAudio.currentTime >= section.end) {
+        sourceAudio.pause();
+        sourceAudio.removeEventListener('timeupdate', stopAt);
+      }
+    };
+    sourceAudio.removeEventListener('timeupdate', stopAt);
+    sourceAudio.addEventListener('timeupdate', stopAt);
   }
 
   function renderSegmentBand(target, sections, duration, showLabels = true) {
@@ -172,7 +198,8 @@
       block.className = `segment-block ${section.type} ${section.selected ? 'selected' : 'unselected'}`;
       block.style.flex = `${Math.max(.01, (section.end - section.start) / duration)} 1 0`;
       block.textContent = showLabels ? section.label : '';
-      block.title = `${section.selected ? '已选中' : '已排除'} · ${section.label} ${formatTime(section.start)}–${formatTime(section.end)}`;
+      const barInfo = section.bars ? ` · ${Math.round(section.bars)} 小节` : '';
+      block.title = `${section.selected ? '已选中' : '已排除'} · ${section.label} ${formatTime(section.start)}–${formatTime(section.end)}${barInfo}`;
       block.setAttribute('aria-pressed', String(section.selected));
       block.addEventListener('click', () => {
         state.sections[index].selected = !state.sections[index].selected;
@@ -285,6 +312,7 @@
     $('#time50').textContent = formatTime(buffer.duration * .5);
     $('#time75').textContent = formatTime(buffer.duration * .75);
     $('#sourceDurationLabel').textContent = formatTime(buffer.duration);
+    renderSegmentEditor();
     syncSelectionUI();
     requestAnimationFrame(() => drawWaveform($('#waveform'), buffer, state.sections));
   }
@@ -308,12 +336,12 @@
       $('#trackInfo').textContent = `${formatBytes(file.size)} · ${(buffer.sampleRate / 1000).toFixed(1)} kHz · ${buffer.numberOfChannels > 1 ? '立体声' : '单声道'}`;
 
       await new Promise(resolve => requestAnimationFrame(() => resolve()));
-      const analysis = window.VistaAudio.analyze(buffer, (percent, detail) => {
+      const analysis = await window.VistaAudio.analyze(buffer, (percent, detail) => {
         $('#loadingPercent').textContent = `${Math.min(96, Math.round(percent * 2.3))}%`;
         $('#loadingDetail').textContent = detail;
       });
       state.analysis = analysis;
-      state.sections = buildSections(analysis, buffer.duration);
+      state.sections = window.VistaAudio.buildSections(analysis, buffer.duration);
 
       if (state.sourceUrl) URL.revokeObjectURL(state.sourceUrl);
       state.sourceUrl = URL.createObjectURL(file);

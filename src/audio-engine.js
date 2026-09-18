@@ -28,7 +28,132 @@
     return mono;
   }
 
-  function analyzeRhythm(buffer, progress = () => {}) {
+  /* ------------------------------------------------------------------ *
+   * 频谱特征（色度 chroma + 谱质心）
+   *
+   * 段落识别不能只看"响不响"。一首歌里响的段落可能有很多种：副歌、器乐间奏、
+   * 预副歌的爬升、尾奏的全奏。真正能把"主歌 / 副歌"分开的是**和声内容的重复**：
+   * 副歌会以几乎相同的和声与配器再次出现，主歌也是。
+   * 所以这里算 12 维色度向量，后面用自相似矩阵找"重复出现的段落"。
+   * ------------------------------------------------------------------ */
+
+  const FFT_SIZE = 2048;
+  const FFT_HOP = 1024;
+  const SPECTRAL_LOW_HZ = 55;
+  const SPECTRAL_HIGH_HZ = 2000;
+
+  function fftInPlace(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i += 1) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const half = len >> 1;
+      const ang = -2 * Math.PI / len;
+      const wr = Math.cos(ang);
+      const wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let cr = 1;
+        let ci = 0;
+        for (let k = 0; k < half; k += 1) {
+          const ur = re[i + k];
+          const ui = im[i + k];
+          const xr = re[i + k + half];
+          const xi = im[i + k + half];
+          const vr = xr * cr - xi * ci;
+          const vi = xr * ci + xi * cr;
+          re[i + k] = ur + vr;
+          im[i + k] = ui + vi;
+          re[i + k + half] = ur - vr;
+          im[i + k + half] = ui - vi;
+          const nr = cr * wr - ci * wi;
+          ci = cr * wi + ci * wr;
+          cr = nr;
+        }
+      }
+    }
+  }
+
+  // 盒式低通 + 抽取。色度只关心 55–2000 Hz，降到约 11 kHz 能让 FFT 次数少 4 倍。
+  function decimate(mono, sampleRate) {
+    let factor = 1;
+    if (sampleRate >= 32000) factor = 4;
+    else if (sampleRate >= 16000) factor = 2;
+    if (factor === 1) return { signal: mono, rate: sampleRate, factor };
+    const length = Math.floor(mono.length / factor);
+    const out = new Float32Array(length);
+    for (let i = 0; i < length; i += 1) {
+      let sum = 0;
+      const base = i * factor;
+      for (let k = 0; k < factor; k += 1) sum += mono[base + k] || 0;
+      out[i] = sum / factor;
+    }
+    return { signal: out, rate: sampleRate / factor, factor };
+  }
+
+  async function spectralFrames(mono, sampleRate, progress = () => {}) {
+    const { signal, rate } = decimate(mono, sampleRate);
+    const overlap = rate / sampleRate; // 抽取比例，用于把抽帧位置换算回原秒数
+    const frameCount = Math.max(1, Math.floor((signal.length - FFT_SIZE) / FFT_HOP) + 1);
+    const chromaFrames = new Float32Array(frameCount * 12);
+    const centroids = new Float32Array(frameCount);
+    const window = new Float32Array(FFT_SIZE);
+    for (let i = 0; i < FFT_SIZE; i += 1) {
+      window[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1));
+    }
+    const re = new Float32Array(FFT_SIZE);
+    const im = new Float32Array(FFT_SIZE);
+    const binHz = rate / FFT_SIZE;
+    const lowBin = Math.max(1, Math.floor(SPECTRAL_LOW_HZ / binHz));
+    const highBin = Math.min(FFT_SIZE / 2, Math.ceil(SPECTRAL_HIGH_HZ / binHz));
+
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      const from = frame * FFT_HOP;
+      for (let i = 0; i < FFT_SIZE; i += 1) {
+        re[i] = (signal[from + i] || 0) * window[i];
+        im[i] = 0;
+      }
+      fftInPlace(re, im);
+
+      let sum = 0;
+      let weighted = 0;
+      const base = frame * 12;
+      for (let k = lowBin; k <= highBin; k += 1) {
+        const magnitude = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+        if (magnitude <= 0) continue;
+        const frequency = k * binHz;
+        const midi = Math.round(69 + 12 * Math.log2(frequency / 440));
+        const pitchClass = ((midi % 12) + 12) % 12;
+        chromaFrames[base + pitchClass] += magnitude;
+        sum += magnitude;
+        weighted += frequency * magnitude;
+      }
+      let norm = 0;
+      for (let c = 0; c < 12; c += 1) norm += chromaFrames[base + c] * chromaFrames[base + c];
+      norm = Math.sqrt(norm);
+      if (norm > 1e-9) {
+        for (let c = 0; c < 12; c += 1) chromaFrames[base + c] /= norm;
+      }
+      centroids[frame] = sum > 1e-9 ? weighted / sum : 0;
+
+      if (frame % 200 === 0) {
+        progress(38 + (frame / frameCount) * 16, '分析和声与音色，寻找重复段落…');
+        await yieldToUi();
+      }
+    }
+    return { chromaFrames, centroids, frameCount, secondsPerFrame: (FFT_HOP * overlap) / sampleRate };
+  }
+
+  // 分析过程是纯计算，中途要让出主线程，否则界面会整体卡住、进度文案不动
+  const yieldToUi = () => new Promise(resolve => setTimeout(resolve, 0));
+
+  async function analyzeRhythm(buffer, progress = () => {}) {
     const mono = monoMix(buffer);
     const sampleRate = buffer.sampleRate;
     const frameSize = 2048;
@@ -44,7 +169,10 @@
         sum += value * value;
       }
       rms[frame] = Math.sqrt(sum / frameSize);
-      if (frame % 1200 === 0) progress(8 + (frame / frameCount) * 18, '扫描响度与瞬态变化…');
+      if (frame % 1200 === 0) {
+        progress(8 + (frame / frameCount) * 18, '扫描响度与瞬态变化…');
+        await yieldToUi();
+      }
     }
 
     const onset = new Float32Array(frameCount);
@@ -69,6 +197,7 @@
         bestScore = score;
         bestBpm = bpm;
       }
+      if (bpm % 30 === 0) await yieldToUi();
     }
 
     const beatFrames = (60 / bestBpm) * framesPerSecond;
@@ -103,6 +232,7 @@
     const barPhaseSeconds = (phaseSeconds + downbeatSlot * beatDuration) % barDuration;
     const barCount = Math.max(1, Math.ceil((buffer.duration - barPhaseSeconds) / barDuration));
     const barEnergy = new Float32Array(barCount);
+    const barOnset = new Float32Array(barCount);
 
     for (let bar = 0; bar < barCount; bar += 1) {
       const startSeconds = barPhaseSeconds + bar * barDuration;
@@ -110,20 +240,83 @@
       const startFrame = Math.max(0, Math.floor((startSeconds * sampleRate) / hop));
       const endFrame = Math.min(frameCount, Math.ceil((endSeconds * sampleRate) / hop));
       let total = 0;
-      for (let i = startFrame; i < endFrame; i += 1) total += rms[i];
-      barEnergy[bar] = total / Math.max(1, endFrame - startFrame);
+      let drumHits = 0;
+      for (let i = startFrame; i < endFrame; i += 1) {
+        total += rms[i];
+        drumHits += onset[i] || 0;
+      }
+      const span = Math.max(1, endFrame - startFrame);
+      barEnergy[bar] = total / span;
+      barOnset[bar] = drumHits / span;
     }
 
     const energyMax = Math.max(...barEnergy, 1e-6);
     for (let i = 0; i < barEnergy.length; i += 1) barEnergy[i] /= energyMax;
+    robustScale(barEnergy);
+    const barOnsetMax = Math.max(...barOnset, 1e-6);
+    for (let i = 0; i < barOnset.length; i += 1) barOnset[i] /= barOnsetMax;
+    robustScale(barOnset);
 
     progress(38, `检测到约 ${bestBpm} BPM，正在定位自然小节…`);
+
+    const spectral = await spectralFrames(mono, sampleRate, progress);
+    const barChroma = new Float32Array(barCount * 12);
+    const barCentroid = new Float32Array(barCount);
+    for (let bar = 0; bar < barCount; bar += 1) {
+      const startSeconds = barPhaseSeconds + bar * barDuration;
+      const endSeconds = Math.min(buffer.duration, startSeconds + barDuration);
+      const from = Math.max(0, Math.floor(startSeconds / spectral.secondsPerFrame));
+      const to = Math.min(spectral.frameCount, Math.max(from + 1, Math.ceil(endSeconds / spectral.secondsPerFrame)));
+      const target = bar * 12;
+      let centroidSum = 0;
+      for (let f = from; f < to; f += 1) {
+        const base = f * 12;
+        for (let c = 0; c < 12; c += 1) barChroma[target + c] += spectral.chromaFrames[base + c];
+        centroidSum += spectral.centroids[f];
+      }
+      const frames = Math.max(1, to - from);
+      let norm = 0;
+      for (let c = 0; c < 12; c += 1) norm += barChroma[target + c] * barChroma[target + c];
+      norm = Math.sqrt(norm);
+      if (norm > 1e-9) {
+        for (let c = 0; c < 12; c += 1) barChroma[target + c] /= norm;
+      }
+      barCentroid[bar] = centroidSum / frames;
+    }
+    const centroidMax = Math.max(...barCentroid, 1e-6);
+    for (let i = 0; i < barCentroid.length; i += 1) barCentroid[i] /= centroidMax;
+    robustScale(barCentroid);
+
+    // 流行歌整首通常同一个调，各段色度向量天然都很像。先减掉全曲平均色度，
+    // 只留下"这一段和声上有何不同"，重复段落的识别才不会糊成一片。
+    const meanChroma = new Float32Array(12);
+    for (let bar = 0; bar < barCount; bar += 1) {
+      const base = bar * 12;
+      for (let c = 0; c < 12; c += 1) meanChroma[c] += barChroma[base + c];
+    }
+    for (let c = 0; c < 12; c += 1) meanChroma[c] /= Math.max(1, barCount);
+    for (let bar = 0; bar < barCount; bar += 1) {
+      const base = bar * 12;
+      let norm = 0;
+      for (let c = 0; c < 12; c += 1) {
+        barChroma[base + c] -= meanChroma[c];
+        norm += barChroma[base + c] * barChroma[base + c];
+      }
+      norm = Math.sqrt(norm);
+      if (norm > 1e-9) {
+        for (let c = 0; c < 12; c += 1) barChroma[base + c] /= norm;
+      }
+    }
+
     return {
       bpm: bestBpm,
       beatDuration,
       barDuration,
       barCount,
       barEnergy,
+      barOnset,
+      barChroma,
+      barCentroid,
       phaseSeconds,
       barPhaseSeconds,
       downbeatSlot,
@@ -135,6 +328,330 @@
     let total = 0;
     for (let i = 0; i < count; i += 1) total += values[start + i] || 0;
     return total / Math.max(1, count);
+  }
+
+  function median(values) {
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  }
+
+  // 绝对中位差：比标准差抗离群值，用作聚类阈值的尺度更稳
+  function mad(values) {
+    if (!values.length) return 0;
+    const center = median(values);
+    return median(values.map(value => Math.abs(value - center)));
+  }
+
+  /* 稳健归一化：用 10%–90% 分位数把数组拉到 0–1，而不是"除以最大值"。
+   * 直接除以最大值会被某一个特别响的高潮小节压扁，整首歌的能量差被压缩到很窄的一段，
+   * 段落换点在曲线上就看不出起伏了。 */
+  function robustScale(values) {
+    if (!values.length) return values;
+    const sorted = [...values].sort((a, b) => a - b);
+    const pick = ratio => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(ratio * (sorted.length - 1))))];
+    const low = pick(0.1);
+    const span = Math.max(1e-6, pick(0.9) - low);
+    for (let i = 0; i < values.length; i += 1) {
+      values[i] = Math.max(0, Math.min(1, (values[i] - low) / span));
+    }
+    return values;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 段落结构分析
+   *
+   * 流行歌的骨架是：前奏 → 主歌 → 预副歌 → 副歌 → 间奏 → 主歌 → 副歌 →（桥段）→ 副歌 → 尾奏
+   *
+   * 判断"主歌 / 副歌"的依据**不是响度**，而是两条乐理事实：
+   *   1. 副歌与主歌都会重复出现，而重复出现的段落和声与配器高度一致；
+   *   2. 同一首歌里，副歌的整体能量与鼓点密度通常高于主歌。
+   * 所以流程是：先用"和声自相似"找出真正重复的段落并分组，
+   * 再在重复组之间比能量，高的一组是副歌，低的一组是主歌。
+   * 只出现一次的段落再按位置与走向判断前奏 / 预副歌 / 间奏 / 桥段 / 尾奏。
+   * ------------------------------------------------------------------ */
+
+  const SECTION_TYPES = {
+    intro: { label: '前奏', color: '#8fa0c6' },
+    verse: { label: '主歌', color: '#7e7ce6' },
+    prechorus: { label: '预副歌', color: '#dd9a3a' },
+    chorus: { label: '副歌', color: '#ef6868' },
+    interlude: { label: '间奏', color: '#4f9e93' },
+    bridge: { label: '桥段', color: '#4a86cf' },
+    outro: { label: '尾奏', color: '#9d9a95' }
+  };
+
+  function barVectors(analysis) {
+    const { barCount } = analysis;
+    const vectors = new Array(barCount);
+    for (let bar = 0; bar < barCount; bar += 1) {
+      const base = bar * 12;
+      const chroma = new Float32Array(12);
+      for (let c = 0; c < 12; c += 1) chroma[c] = analysis.barChroma[base + c];
+      vectors[bar] = {
+        chroma,
+        energy: analysis.barEnergy[bar],
+        onset: analysis.barOnset[bar],
+        centroid: analysis.barCentroid[bar]
+      };
+    }
+    return vectors;
+  }
+
+  /* 小节级相似度。
+   * 权重是按"对段落识别有多管用"排的，而不是听起来多专业：
+   * 实测流行歌整首和弦高度接近，纯靠色度算相似度会全部落在 0.9 以上、完全分不开段；
+   * 力度（能量）与鼓点密度才是真正把主歌和副歌分开的量；明亮度次之；色度只做兜底。 */
+  function frameSimilarity(a, b) {
+    let dot = 0;
+    for (let i = 0; i < 12; i += 1) dot += a.chroma[i] * b.chroma[i];
+    const tone = Math.max(0, dot);
+    const power = 1 - Math.min(1, Math.abs(a.energy - b.energy) * 2.2);
+    const drive = 1 - Math.min(1, Math.abs(a.onset - b.onset) * 2.0);
+    const colour = 1 - Math.min(1, Math.abs(a.centroid - b.centroid) * 1.8);
+    return tone * 0.24 + power * 0.34 + drive * 0.24 + colour * 0.18;
+  }
+
+  // 新颖度：某小节前后各 4 小节互不相似的程度，峰值就是段落换点
+  function noveltyCurve(vectors) {
+    const barCount = vectors.length;
+    const span = 4;
+    const raw = new Float32Array(barCount);
+    for (let i = span; i <= barCount - span; i += 1) {
+      let sum = 0;
+      for (let p = 0; p < span; p += 1) {
+        for (let q = 0; q < span; q += 1) sum += frameSimilarity(vectors[i - span + p], vectors[i + q]);
+      }
+      raw[i] = 1 - sum / (span * span);
+    }
+    // 三点滑动平均，压掉"乐句内部换句"这类毛刺，只留真正的段落换点
+    const smooth = new Float32Array(barCount);
+    for (let i = 1; i < barCount - 1; i += 1) smooth[i] = (raw[i - 1] + raw[i] * 2 + raw[i + 1]) / 4;
+    return smooth;
+  }
+
+  /* 分段策略：以 8 小节（短歌 4 小节）为基本格点保证颗粒度，
+   * 再把每个格点吸附到 ±2 小节内新颖度最高的位置，让边界尽量落在真实的段落换点上。
+   * 纯靠换点检测会切得忽长忽短，纯靠固定格点又会切在乐句中间，两者结合最稳。 */
+  function sectionBounds(vectors) {
+    const barCount = vectors.length;
+    const smooth = noveltyCurve(vectors);
+    const cell = barCount >= 48 ? 8 : 4;
+    const bounds = [0];
+    for (let grid = cell; grid <= barCount - 4; grid += cell) {
+      let best = grid;
+      let bestValue = -1;
+      for (let k = Math.max(2, grid - 2); k <= Math.min(barCount - 3, grid + 2); k += 1) {
+        if (smooth[k] > bestValue) {
+          bestValue = smooth[k];
+          best = k;
+        }
+      }
+      const previous = bounds[bounds.length - 1];
+      const snapped = best > previous + 3 ? best : grid;
+      if (snapped > previous + 3 && snapped < barCount - 2) bounds.push(snapped);
+    }
+    bounds.push(barCount);
+    return bounds;
+  }
+
+  function segmentFeatures(vectors, fromBar, toBar) {
+    const seq = vectors.slice(fromBar, toBar);
+    const bars = Math.max(1, seq.length);
+    let energy = 0;
+    let onset = 0;
+    let centroid = 0;
+    for (const vector of seq) {
+      energy += vector.energy;
+      onset += vector.onset;
+      centroid += vector.centroid;
+    }
+    return { seq, bars, energy: energy / bars, onset: onset / bars, centroid: centroid / bars };
+  }
+
+  /* 段落相似度：按相对位置逐小节对齐比较，而不是只比"平均向量"。
+   * 两段副歌的平均能量也许和主歌差不多，但它们随时间的起伏形状是独有的，
+   * 对齐比较才能把"同一段再次出现"认出来。 */
+  function segmentSimilarity(a, b) {
+    const steps = Math.min(24, a.seq.length, b.seq.length);
+    if (!steps) return 0;
+    let sum = 0;
+    for (let k = 0; k < steps; k += 1) {
+      const ai = a.seq[Math.min(a.seq.length - 1, Math.floor(((k + 0.5) * a.seq.length) / steps))];
+      const bi = b.seq[Math.min(b.seq.length - 1, Math.floor(((k + 0.5) * b.seq.length) / steps))];
+      sum += frameSimilarity(ai, bi);
+    }
+    return sum / steps;
+  }
+
+  /* 贪心聚类。阈值不写死，取"比大多数段间相似度明显更高"的那一档；
+   * 用中位数 + 绝对中位差而不是均值 + 标准差，避免个别离群段（比如很安静的引子）把阈值算飞。 */
+  function groupSegments(features) {
+    const pairs = [];
+    for (let i = 0; i < features.length; i += 1) {
+      for (let j = i + 1; j < features.length; j += 1) pairs.push(segmentSimilarity(features[i], features[j]));
+    }
+    const threshold = pairs.length ? Math.max(0.76, median(pairs) + mad(pairs) * 0.9) : 1;
+
+    const groups = [];
+    features.forEach((feature, index) => {
+      let best = null;
+      let bestScore = 0;
+      for (const group of groups) {
+        // 与组内成员逐一比较后取平均，比只看第一个成员稳
+        let sum = 0;
+        for (const member of group.members) sum += segmentSimilarity(features[member], feature);
+        const score = sum / group.members.length;
+        if (score > bestScore) {
+          bestScore = score;
+          best = group;
+        }
+      }
+      if (best && bestScore >= threshold) best.members.push(index);
+      else groups.push({ members: [index] });
+    });
+    return { groups, threshold };
+  }
+
+  function buildStructure(analysis, duration) {
+    const { barCount, barDuration, barPhaseSeconds } = analysis;
+    const vectors = barVectors(analysis);
+    const bounds = sectionBounds(vectors);
+    const starts = bounds;
+
+    const features = [];
+    for (let i = 0; i < starts.length - 1; i += 1) features.push(segmentFeatures(vectors, starts[i], starts[i + 1]));
+
+    const { groups } = groupSegments(features);
+    const stats = groups.map((group, id) => ({
+      id,
+      count: group.members.length,
+      energy: group.members.reduce((sum, i) => sum + features[i].energy, 0) / group.members.length,
+      bars: group.members.reduce((sum, i) => sum + features[i].bars, 0) / group.members.length,
+      first: Math.min(...group.members)
+    }));
+    const groupOf = new Array(features.length);
+    groups.forEach((group, id) => group.members.forEach(member => { groupOf[member] = id; }));
+
+    const repeated = stats.filter(item => item.count >= 2);
+    let chorusId;
+    if (repeated.length) {
+      // 重复出现的段落里最"满"的那一组就是副歌
+      chorusId = [...repeated].sort((a, b) => (b.energy - a.energy) || (b.bars - a.bars) || (a.first - b.first))[0].id;
+    } else {
+      chorusId = [...stats].sort((a, b) => b.energy - a.energy)[0].id;
+    }
+    const verseIds = new Set(repeated.filter(item => item.id !== chorusId).map(item => item.id));
+
+    const energies = features.map(feature => feature.energy);
+    const medianEnergy = median(energies);
+    const types = new Array(features.length).fill(null);
+
+    features.forEach((feature, index) => {
+      const id = groupOf[index];
+      const isFirst = index === 0;
+      const isLast = index === features.length - 1;
+      const position = index / Math.max(1, features.length - 1);
+      const veryQuiet = feature.energy < medianEnergy * 0.5;
+      // 首尾段落：本身就是独一份，或者明显比全曲安静，就是前奏 / 尾奏
+      if (isFirst && (stats[id].count === 1 || veryQuiet)) {
+        types[index] = 'intro';
+        return;
+      }
+      if (isLast) {
+        // 结尾依然很满，多半是最后一次副歌（升调或加花），按副歌算更安全：
+        // 若误判成尾奏，用户很可能把整首歌最好听的段落给排除了。
+        if (feature.energy >= medianEnergy && id !== chorusId) {
+          types[index] = 'chorus';
+          return;
+        }
+        if (stats[id].count === 1 || veryQuiet) {
+          types[index] = 'outro';
+          return;
+        }
+      }
+      // 曲子尾部安静下来的段落也归尾奏（尾奏常常不止一段，拆成"间奏＋尾奏"没有意义）
+      if (position > 0.8 && feature.energy < medianEnergy * 0.4) {
+        types[index] = 'outro';
+        return;
+      }
+      // 通篇明显安静的段落是间奏——它可能恰好与某个主歌分到同一组，但听感上是间奏。
+      // 开头那几小节不算：刚起唱时的安静是主歌的常态，不是间奏。
+      if (position > 0.12 && feature.energy < medianEnergy * 0.35) {
+        types[index] = 'interlude';
+        return;
+      }
+      if (id === chorusId) {
+        types[index] = 'chorus';
+        return;
+      }
+      if (verseIds.has(id)) {
+        types[index] = 'verse';
+        return;
+      }
+      const leadsIntoChorus = index + 1 < features.length && groupOf[index + 1] === chorusId;
+      if (leadsIntoChorus && feature.energy < features[index + 1].energy) {
+        types[index] = 'prechorus';
+        return;
+      }
+      if (index >= Math.floor(features.length / 3) && feature.energy >= medianEnergy * 0.9) {
+        types[index] = 'bridge';
+        return;
+      }
+      if (feature.energy < medianEnergy * 0.75) {
+        types[index] = 'interlude';
+        return;
+      }
+      types[index] = 'verse';
+    });
+
+    const raw = [];
+    for (let index = 0; index < features.length; index += 1) {
+      const startBar = Math.max(0, Math.min(barCount, starts[index]));
+      const endBar = Math.max(startBar, Math.min(barCount, starts[index + 1]));
+      let start = index === 0 ? 0 : barPhaseSeconds + startBar * barDuration;
+      let end = index === features.length - 1 ? duration : barPhaseSeconds + endBar * barDuration;
+      start = Math.max(0, Math.min(duration, start));
+      end = Math.max(start + 0.1, Math.min(duration, end));
+      raw.push({
+        start,
+        end,
+        type: types[index],
+        energy: features[index].energy,
+        bars: features[index].bars,
+        group: groupOf[index]
+      });
+    }
+
+    /* 相邻同类段落合成一段，否则会出现"主歌1、主歌2"紧挨着这种别扭结果。
+     * 但加上长度上限：流行歌里单个段落很少超过 24 小节，
+     * 若不加限制，一串安静的小节会被并成一个一分钟长的"主歌"，反而更不准。 */
+    const MAX_SECTION_BARS = 24;
+    const merged = [];
+    for (const item of raw) {
+      const previous = merged[merged.length - 1];
+      if (previous && previous.type === item.type && previous.bars + item.bars <= MAX_SECTION_BARS) {
+        previous.energy = (previous.energy * previous.bars + item.energy * item.bars) / (previous.bars + item.bars);
+        previous.end = item.end;
+        previous.bars += item.bars;
+      } else {
+        merged.push({ ...item });
+      }
+    }
+
+    // 给会多次出现的段落编号（主歌1 / 主歌2 / 副歌1 …）
+    const totals = {};
+    merged.forEach(item => { totals[item.type] = (totals[item.type] || 0) + 1; });
+    const counters = {};
+    merged.forEach(item => {
+      counters[item.type] = (counters[item.type] || 0) + 1;
+      const repeatable = item.type === 'verse' || item.type === 'chorus' || item.type === 'prechorus' || item.type === 'interlude';
+      const numbered = repeatable && totals[item.type] > 1;
+      item.label = `${SECTION_TYPES[item.type].label}${numbered ? counters[item.type] : ''}`;
+      item.selected = true;
+    });
+    return merged;
   }
 
   function chooseMiddleStart(analysis, middleBars, introBars, outroBars, strategy) {
@@ -543,7 +1060,7 @@
     if (targetSeconds >= buffer.duration - 1) throw new Error('目标时长需要短于原曲至少 1 秒。');
     progress(3, '读取音频波形…');
     await new Promise(resolve => setTimeout(resolve, 30));
-    const analysis = precomputedAnalysis || analyzeRhythm(buffer, progress);
+    const analysis = precomputedAnalysis || await analyzeRhythm(buffer, progress);
     const strategies = requestedStrategy === 'all' ? ['energy', 'balanced', 'smooth'] : [requestedStrategy];
     const results = [];
     for (let i = 0; i < strategies.length; i += 1) {
@@ -563,5 +1080,5 @@
     return { analysis, results };
   }
 
-  window.VistaAudio = { decodeFile, analyze: analyzeRhythm, process, STRATEGIES };
+  window.VistaAudio = { decodeFile, analyze: analyzeRhythm, buildSections: buildStructure, SECTION_TYPES, process, STRATEGIES };
 })();

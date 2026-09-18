@@ -77,7 +77,7 @@
               <article class="analysis-card">
                 <div class="card-toolbar">
                   <div><span class="section-kicker">STRUCTURE MAP</span><h2>选择参与重编排的歌曲段落</h2></div>
-                  <div class="toolbar-right"><div class="legend"><span><i class="verse"></i>平稳</span><span><i class="lift"></i>推进</span><span><i class="chorus"></i>高潮</span><span><i class="outro"></i>收尾</span></div><div class="selection-tools"><button id="selectAllBtn">全选</button><button id="clearSelectionBtn">清空</button></div></div>
+                  <div class="toolbar-right"><div class="legend"><span><i class="intro"></i>前奏</span><span><i class="verse"></i>主歌</span><span><i class="prechorus"></i>预副歌</span><span><i class="chorus"></i>副歌</span><span><i class="interlude"></i>间奏</span><span><i class="bridge"></i>桥段</span><span><i class="outro"></i>尾奏</span></div><div class="selection-tools"><button id="selectAllBtn">全选</button><button id="clearSelectionBtn">清空</button><button id="editSegmentsBtn">手动修正段落</button></div></div>
                 </div>
                 <div class="wave-shell">
                   <div class="wave-controls"><button id="sourcePlayBtn">▶ <span>试听原曲</span></button><span id="sourceTime">00:00</span><button id="zoomBtn">1×</button><span class="beat-pill">强拍与乐句已对齐</span></div>
@@ -86,6 +86,13 @@
                   <div id="segmentBand" class="segment-band"></div>
                 </div>
                 <div class="analysis-note"><span>i</span><p><strong>点击下方彩色段落即可选择或排除。</strong>只有选中的段落会参与后续重编排。当前已选择 <b id="selectedCount">0</b> 个段落。</p><button id="goRetargetBtn">用所选段落重塑时长 →</button></div>
+                <div id="segmentEditor" class="segment-editor hidden">
+                  <div class="segment-editor-head">
+                    <div><strong>段落结构</strong><span>按和声重复度自动判定，判断有出入时可直接改。</span></div>
+                    <span class="segment-editor-hint">点时间可单独试听那一段</span>
+                  </div>
+                  <div id="segmentEditorList" class="segment-editor-list"></div>
+                </div>
               </article>
             </div>
 
