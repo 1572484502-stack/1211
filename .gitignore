@@ -1,5 +1,6 @@
 node_modules/
 .workbuddy/
+推广物料/
 *.log
 *.tmp
 *.temp

@@ -1,6 +1,6 @@
 {
   "name": "vista-studio",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "视界工坊（Vista Studio）— 本地智能影音创作工作台",
   "main": "main.cjs",
