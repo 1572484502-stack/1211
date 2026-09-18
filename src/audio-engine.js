@@ -97,9 +97,8 @@
     return { signal: out, rate: sampleRate / factor, factor };
   }
 
-  async function spectralFrames(mono, sampleRate, progress = () => {}) {
+  async   function spectralFrames(mono, sampleRate, progress = () => {}) {
     const { signal, rate } = decimate(mono, sampleRate);
-    const overlap = rate / sampleRate; // 抽取比例，用于把抽帧位置换算回原秒数
     const frameCount = Math.max(1, Math.floor((signal.length - FFT_SIZE) / FFT_HOP) + 1);
     const chromaFrames = new Float32Array(frameCount * 12);
     const centroids = new Float32Array(frameCount);
@@ -147,7 +146,9 @@
         await yieldToUi();
       }
     }
-    return { chromaFrames, centroids, frameCount, secondsPerFrame: (FFT_HOP * overlap) / sampleRate };
+    // 帧步长是在"抽取之后"的信号上计的，所以要用抽取后的采样率换算，
+    // 不能乘回原采样率——否则每帧被低估 16 倍，除开头几小节外全部取不到数据。
+    return { chromaFrames, centroids, frameCount, secondsPerFrame: FFT_HOP / rate };
   }
 
   // 分析过程是纯计算，中途要让出主线程，否则界面会整体卡住、进度文案不动
@@ -265,7 +266,7 @@
     for (let bar = 0; bar < barCount; bar += 1) {
       const startSeconds = barPhaseSeconds + bar * barDuration;
       const endSeconds = Math.min(buffer.duration, startSeconds + barDuration);
-      const from = Math.max(0, Math.floor(startSeconds / spectral.secondsPerFrame));
+      const from = Math.min(spectral.frameCount - 1, Math.max(0, Math.floor(startSeconds / spectral.secondsPerFrame)));
       const to = Math.min(spectral.frameCount, Math.max(from + 1, Math.ceil(endSeconds / spectral.secondsPerFrame)));
       const target = bar * 12;
       let centroidSum = 0;
@@ -344,6 +345,13 @@
     return median(values.map(value => Math.abs(value - center)));
   }
 
+  function percentile(values, ratio) {
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const index = Math.min(sorted.length - 1, Math.max(0, Math.round(ratio * (sorted.length - 1))));
+    return sorted[index];
+  }
+
   /* 稳健归一化：用 10%–90% 分位数把数组拉到 0–1，而不是"除以最大值"。
    * 直接除以最大值会被某一个特别响的高潮小节压扁，整首歌的能量差被压缩到很窄的一段，
    * 段落换点在曲线上就看不出起伏了。 */
@@ -403,6 +411,17 @@
    * 权重是按"对段落识别有多管用"排的，而不是听起来多专业：
    * 实测流行歌整首和弦高度接近，纯靠色度算相似度会全部落在 0.9 以上、完全分不开段；
    * 力度（能量）与鼓点密度才是真正把主歌和副歌分开的量；明亮度次之；色度只做兜底。 */
+  /* 小节级相似度的权重。这几个数字是拿四首真实歌曲做对照实验试出来的，不是照搬教科书。
+   *
+   * 关于 tone（和声色度）：权重刻意设为 0。
+   * 理论上和声自相似是判断"同一段再次出现"的正统依据，但实测在这套实现下它帮倒忙——
+   * 55–2000 Hz 频段里鼓组（底鼓基频、军鼓噪声）占了主要能量，
+   * 算出来的色度反映的是鼓而不是和声，两次副歌之间的色度相似度并不比副歌与主歌之间高，
+   * 把它计入总分反而把真正有效的线索稀释掉（实测会让 4 首歌里的 3 首出现"整首都不重复"）。
+   * 真正能把主歌和副歌分开的是**力度与鼓点密度**。想重新启用色度，需要先做谐波/打击分离，
+   * 那时再给它权重。 */
+  const SIMILARITY_WEIGHTS = { tone: 0, power: 0.52, drive: 0.34, colour: 0.14 };
+
   function frameSimilarity(a, b) {
     let dot = 0;
     for (let i = 0; i < 12; i += 1) dot += a.chroma[i] * b.chroma[i];
@@ -410,7 +429,10 @@
     const power = 1 - Math.min(1, Math.abs(a.energy - b.energy) * 2.2);
     const drive = 1 - Math.min(1, Math.abs(a.onset - b.onset) * 2.0);
     const colour = 1 - Math.min(1, Math.abs(a.centroid - b.centroid) * 1.8);
-    return tone * 0.24 + power * 0.34 + drive * 0.24 + colour * 0.18;
+    return tone * SIMILARITY_WEIGHTS.tone
+      + power * SIMILARITY_WEIGHTS.power
+      + drive * SIMILARITY_WEIGHTS.drive
+      + colour * SIMILARITY_WEIGHTS.colour;
   }
 
   // 新颖度：某小节前后各 4 小节互不相似的程度，峰值就是段落换点
@@ -485,14 +507,19 @@
     return sum / steps;
   }
 
-  /* 贪心聚类。阈值不写死，取"比大多数段间相似度明显更高"的那一档；
-   * 用中位数 + 绝对中位差而不是均值 + 标准差，避免个别离群段（比如很安静的引子）把阈值算飞。 */
+  /* 贪心聚类。阈值必须用"分布相对判据"而不是一个绝对数字——
+   * 相似度的绝对尺度取决于各特征权重，写死 0.76 这种值，换个权重就整段失效。
+   * 这里的判据是：一对段落要算"同一段再次出现"，得同时满足
+   *   ① 落在最相似的那 20% 里；② 明显高于中位数（中位数 + 1.5 倍绝对中位差）。
+   * 两条都过，才认为是真的重复，避免把"都不太像"的歌硬凑出组来。 */
   function groupSegments(features) {
     const pairs = [];
     for (let i = 0; i < features.length; i += 1) {
       for (let j = i + 1; j < features.length; j += 1) pairs.push(segmentSimilarity(features[i], features[j]));
     }
-    const threshold = pairs.length ? Math.max(0.76, median(pairs) + mad(pairs) * 0.9) : 1;
+    const threshold = pairs.length
+      ? Math.max(percentile(pairs, 0.8), median(pairs) + mad(pairs) * 1.5)
+      : 1;
 
     const groups = [];
     features.forEach((feature, index) => {
